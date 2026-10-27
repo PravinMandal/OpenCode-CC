@@ -255,7 +255,12 @@ class ControlHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # A short health probe may time out while WireGuard is starting.
+            # It is not a reason to emit a traceback into the journal.
+            pass
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib API
         if self.path == "/health":
