@@ -57,8 +57,17 @@ export function normalize(body) {
 
 export class Sessions {
   entries = new Map();
+  scope(headers) {
+    return hash((headers.get("authorization") || "") + "|" + (headers.get("x-opencode-session") || ""));
+  }
+  // Called only before any response bytes have been forwarded. A quota
+  // rejection is not a committed turn, so a fresh protocol session is safe
+  // and gives the retry a new server-side affinity.
+  invalidate(headers) {
+    this.entries.delete(this.scope(headers));
+  }
   get(headers, now = Date.now()) {
-    const scope = hash((headers.get("authorization") || "") + "|" + (headers.get("x-opencode-session") || ""));
+    const scope = this.scope(headers);
     let entry = this.entries.get(scope);
     // Keep tool turns sticky. Refresh protocol timestamps independently of
     // response status; this never clears any account/network quota state.
@@ -89,11 +98,35 @@ export function upstreamHeaders(incoming, sessions) {
   return headers;
 }
 
-export function makeHandler({ routes, fetcher = fetch, onExhausted = () => {}, sessions = new Sessions() }) {
-  let preferred = 0, inflight = 0;
+export function makeHandler({ routes, fetcher = fetch, onExhausted = () => {}, sessions = new Sessions(),
+  rotate = false, recover = undefined, recoverRetries = 0 }) {
+  if (!routes?.length) throw new Error("At least one DS route is required");
+  // `fallback` routes (normally direct) are only used after every WARP route
+  // has failed. In rotate mode, the WARP routes are cycled per request so a
+  // single shared egress IP is never the only path for a long session.
+  const primary = routes.filter(route => !route.fallback);
+  const primaryRoutes = primary.length ? primary : routes;
+  const fallbackRoutes = primary.length ? routes.filter(route => route.fallback) : [];
+  const retries = Math.max(0, Number(recoverRetries) || 0);
+  let primaryIndex = 0;
+  let preferred = routes[0];
+  let inflight = 0;
+
+  const currentRoute = () => rotate ? primaryRoutes[primaryIndex % primaryRoutes.length] : preferred;
+  const order = () => {
+    if (!rotate) return [preferred, ...routes.filter(route => route !== preferred)];
+    const start = primaryIndex % primaryRoutes.length;
+    return [...primaryRoutes.slice(start), ...primaryRoutes.slice(0, start), ...fallbackRoutes];
+  };
+  const advance = route => {
+    if (!rotate) { preferred = route; return; }
+    const index = primaryRoutes.indexOf(route);
+    if (index >= 0) primaryIndex = (index + 1) % primaryRoutes.length;
+  };
+
   return async request => {
     if (request.method === "GET" && new URL(request.url).pathname === "/health")
-      return Response.json({ ok: true, model: MODEL, route: routes[preferred].name, inflight });
+      return Response.json({ ok: true, model: MODEL, route: currentRoute().name, inflight });
     if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/chat/completions") return new Response("Not found", { status: 404 });
     if (!/^Bearer\s+\S+/i.test(request.headers.get("authorization") || ""))
       return Response.json({ error: { type: "authentication_error", message: "Upstream credential required" } }, { status: 401 });
@@ -104,41 +137,56 @@ export function makeHandler({ routes, fetcher = fetch, onExhausted = () => {}, s
       if (Buffer.byteLength(raw) > MAX_BODY) return new Response("Request too large", { status: 413 });
       body = normalize(raw);
     } catch (error) { return Response.json({ error: { type: "invalid_request_error", message: String(error) } }, { status: 400 }); }
-    const headers = upstreamHeaders(request.headers, sessions);
     inflight++;
     try {
       let last;
-      const order = routes.map((_, i) => (preferred + i) % routes.length);
-      for (const index of order) {
-        const route = routes[index];
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 30000);
-        try {
-          const response = await fetcher(endpoint, { method: "POST", headers, body, proxy: route.proxy,
-            signal: AbortSignal.any([request.signal, controller.signal]) });
-          clearTimeout(timer); // bound headers, not a healthy long generation
-          log({ event: "inference", route: route.name, status: response.status });
-          if (response.status === 429) {
-            let error;
-            try { error = await response.clone().json(); } catch {}
-            if (error?.error?.type === "FreeUsageLimitError") {
-              if (last) await last.body?.cancel();
-              last = response;
-              continue;
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        // Sessions are scoped by auth + incoming client session. Recompute per
+        // attempt so invalidate() can issue a fresh protocol affinity before a
+        // quota retry.
+        const headers = upstreamHeaders(request.headers, sessions);
+        for (const route of order()) {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 30000);
+          try {
+            const response = await fetcher(endpoint, { method: "POST", headers, body, proxy: route.proxy,
+              signal: AbortSignal.any([request.signal, controller.signal]) });
+            clearTimeout(timer); // bound headers, not a healthy long generation
+            log({ event: "inference", route: route.name, status: response.status });
+            if (response.status === 429) {
+              let error;
+              try { error = await response.clone().json(); } catch {}
+              if (error?.error?.type === "FreeUsageLimitError") {
+                if (last) await last.body?.cancel();
+                last = response;
+                continue;
+              }
             }
-          }
-          if (last) await last.body?.cancel();
-          if (response.ok) preferred = index;
-          return relay(guardStream(response, request.signal, () => {
-            preferred = (index + 1) % routes.length;
-            log({ event: "transport_failure", route: route.name, phase: "response_stream" });
-          }));
-        } catch (error) {
-          if (request.signal.aborted) throw error;
-          log({ event: "transport_failure", route: route.name });
-        } finally { clearTimeout(timer); }
+            if (last) await last.body?.cancel();
+            if (response.ok) advance(route);
+            return relay(guardStream(response, request.signal, () => {
+              advance(route);
+              log({ event: "transport_failure", route: route.name, phase: "response_stream" });
+            }));
+          } catch (error) {
+            if (request.signal.aborted) throw error;
+            log({ event: "transport_failure", route: route.name });
+          } finally { clearTimeout(timer); }
+        }
+        // Only a free-limit rejection (or a route-wide transport outage) is
+        // safe to replay: no response bytes have been committed. Ask the
+        // local WARP pool to replace its egress IPs, then make one more pass.
+        const canRecover = attempt < retries && recover && (last?.status === 429 || !last);
+        if (!canRecover) break;
+        sessions.invalidate(request.headers);
+        const recovered = await recover();
+        log({ event: "egress_recovery", attempt: attempt + 1, ok: Boolean(recovered) });
+        if (!recovered) break;
+        // Keep the quota response until rotation is confirmed. If rotation
+        // fails, it remains the truthful result returned below.
+        if (last) { await last.body?.cancel(); last = undefined; }
       }
-      onExhausted();
+      await onExhausted();
       // Preserve the actual quota response and Retry-After when all routes
       // reject. Never turn an error into success, change accounts or models.
       return last ? relay(last) : Response.json({ error: { type: "api_error", message: "DS Flash egress unavailable" } }, { status: 502 });
@@ -179,10 +227,40 @@ if (import.meta.main) {
       log({ event: "phone_reset_not_verified" });
     })().catch(() => log({ event: "phone_reset_failed" })).finally(() => { resetting = undefined; });
   };
-  const routeNames = (process.env.DS_FLASH_ROUTES || "phone,direct").split(",");
-  const known = { phone: { name: "phone", proxy: "http://127.0.0.1:18889" }, direct: { name: "direct", proxy: false } };
-  const routes = routeNames.map(name => { if (!known[name]) throw new Error("Unknown DS route"); return known[name]; });
+  const routeNames = (process.env.DS_FLASH_ROUTES || "phone,direct").split(",").map(name => name.trim()).filter(Boolean);
+  const known = {
+    phone: { name: "phone", proxy: "http://127.0.0.1:18889" },
+    direct: { name: "direct", proxy: false, fallback: true },
+  };
+  // Userspace WARP profiles exposed as local HTTP CONNECT proxies. They are
+  // independent Cloudflare WARP tunnels; no host route or default gateway is
+  // changed. The helper only ever sees these loopback URLs.
+  const warpProxies = (process.env.DS_FLASH_WARP_PROXIES || "").split(",").map(value => value.trim()).filter(Boolean);
+  warpProxies.forEach((proxy, index) => {
+    const name = `warp${index + 1}`;
+    known[name] = { name, proxy };
+  });
+  if (!routeNames.length) throw new Error("DS_FLASH_ROUTES is empty");
+  const routes = routeNames.map(name => { if (!known[name]) throw new Error("Unknown DS route: " + name); return known[name]; });
+  const warpPool = (process.env.DS_FLASH_WARP_POOL_URL || "").replace(/\/+$/, "");
+  const recoverWarp = async () => {
+    if (!warpPool) return false;
+    try {
+      const response = await fetch(warpPool + "/rotate", { method: "POST", signal: AbortSignal.timeout(60000) });
+      let result = {};
+      try { result = await response.json(); } catch {}
+      log({ event: "warp_pool_rotate", ok: response.ok, changed: result.changed ?? null });
+      return response.ok;
+    } catch (error) {
+      log({ event: "warp_pool_rotate_failed", error: String(error).slice(0, 200) });
+      return false;
+    }
+  };
+  const rotate = process.env.DS_FLASH_ROTATE === "1";
+  const recoverRetries = Number(process.env.DS_FLASH_RECOVER_RETRIES || 0);
   const server = Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.DS_FLASH_PORT || 18790),
-    maxRequestBodySize: MAX_BODY, idleTimeout: 255, fetch: makeHandler({ routes, onExhausted: reset }) });
-  log({ event: "listening", port: server.port, model: MODEL, routes: routeNames });
+    maxRequestBodySize: MAX_BODY, idleTimeout: 255,
+    fetch: makeHandler({ routes, onExhausted: reset, rotate, recover: recoverWarp, recoverRetries }) });
+  log({ event: "listening", port: server.port, model: MODEL, routes: routeNames, rotate,
+    warp_proxies: warpProxies.length, warp_pool: Boolean(warpPool), recover_retries: Math.max(0, recoverRetries || 0) });
 }

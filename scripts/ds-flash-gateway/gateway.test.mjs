@@ -58,6 +58,78 @@ test("network rejection fails over with the same credential/model, and pins the 
   expect(calls.every(c => c.key === "Bearer fixture" && c.model === MODEL)).toBe(true);
 });
 
+test("rotate mode cycles WARP routes per request and keeps direct as fallback-only", async () => {
+  const calls = [];
+  const routes = [{ name: "warp1", proxy: "w1" }, { name: "warp2", proxy: "w2" },
+    { name: "direct", proxy: false, fallback: true }];
+  const handler = makeHandler({ routes, rotate: true, fetcher: async (_url, init) => {
+    calls.push(init.proxy);
+    return new Response("data: rotated reply\n\n");
+  } });
+  const request = () => new Request("http://localhost/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer fixture" }, body: JSON.stringify(body) });
+  for (let i = 0; i < 4; i++) expect(await (await handler(request())).text()).toContain("rotated reply");
+  expect(calls).toEqual(["w1", "w2", "w1", "w2"]);
+});
+
+test("rotate mode falls back to direct only when every WARP route rejects", async () => {
+  const calls = [];
+  const routes = [{ name: "warp1", proxy: "w1" }, { name: "warp2", proxy: "w2" },
+    { name: "direct", proxy: false, fallback: true }];
+  const handler = makeHandler({ routes, rotate: true, fetcher: async (_url, init) => {
+    calls.push(init.proxy);
+    return init.proxy ? Response.json({ error: { type: "FreeUsageLimitError" } }, { status: 429 })
+      : new Response("data: direct reply\n\n");
+  } });
+  const request = () => new Request("http://localhost/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer fixture" }, body: JSON.stringify(body) });
+  expect(await (await handler(request())).text()).toContain("direct reply");
+  expect(await (await handler(request())).text()).toContain("direct reply");
+  expect(calls).toEqual(["w1", "w2", false, "w1", "w2", false]);
+});
+
+test("quota exhaustion rotates egress and retries with a fresh session", async () => {
+  let calls = 0, recoveries = 0, exhausted = 0;
+  const sessionsSeen = [];
+  const routes = [{ name: "warp1", proxy: "w1" }, { name: "warp2", proxy: "w2" },
+    { name: "direct", proxy: false, fallback: true }];
+  const handler = makeHandler({ routes, rotate: true, recoverRetries: 1,
+    onExhausted: () => exhausted++,
+    recover: async () => { recoveries++; return true; },
+    fetcher: async (_url, init) => {
+      calls++;
+      sessionsSeen.push(init.headers.get("x-opencode-session"));
+      if (calls <= 3) return Response.json({ error: { type: "FreeUsageLimitError" } },
+        { status: 429, headers: { "Retry-After": "5" } });
+      return new Response("data: recovered reply\n\n");
+    } });
+  const request = () => new Request("http://localhost/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer fixture", "x-opencode-session": "conversation" }, body: JSON.stringify(body) });
+  const response = await handler(request());
+  expect(await response.text()).toContain("recovered reply");
+  expect(recoveries).toBe(1);
+  expect(exhausted).toBe(0);
+  expect(calls).toBe(4);
+  expect(sessionsSeen[0]).not.toBe(sessionsSeen[3]);
+});
+
+test("failed rotation preserves the real quota response and Retry-After", async () => {
+  let calls = 0, exhausted = 0;
+  const routes = [{ name: "warp1", proxy: "w1" }, { name: "warp2", proxy: "w2" },
+    { name: "direct", proxy: false, fallback: true }];
+  const handler = makeHandler({ routes, rotate: true, recoverRetries: 1,
+    onExhausted: () => exhausted++,
+    recover: async () => false,
+    fetcher: async () => { calls++; return Response.json({ error: { type: "FreeUsageLimitError" } }, { status: 429, headers: { "Retry-After": "321" } }); } });
+  const response = await handler(new Request("http://localhost/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer fixture" }, body: JSON.stringify(body) }));
+  expect(response.status).toBe(429);
+  expect(response.headers.get("Retry-After")).toBe("321");
+  expect(calls).toBe(3);
+  expect(exhausted).toBe(1);
+  await response.text();
+});
+
 test("auth errors do not rotate routes; genuine all-route quota responses keep Retry-After", async () => {
   for (const status of [401, 403, 429]) {
     let calls = 0, exhausted = 0;

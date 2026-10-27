@@ -1,0 +1,21 @@
+[Unit]
+Description=Loopback userspace Cloudflare WARP pool for DS Flash
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/opencode-cc-warp-pool
+Environment=PYTHONUNBUFFERED=1
+Environment=WARP_POOL_DIR=%h/.config/opencode-cc/warp
+Environment=WARP_POOL_STATE=%h/.local/state/opencode-cc-warp-pool
+Environment=WIREPROXY_BIN=%h/.local/bin/wireproxy
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=25
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
