@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { normalize, Sessions, makeHandler, guardStream, MODEL } from "./gateway.mjs";
+import { normalize, Sessions, makeHandler, guardStream, upstreamHeaders, isForwardableSession, MODEL } from "./gateway.mjs";
 const body = { model: MODEL, messages: [{ role: "system", content: "CLIENT_POLICY_ONE" },
   { role: "system", content: "CLIENT_POLICY_TWO" }, { role: "user", content: "task" }],
   tools: [{ type: "function", function: { name: "Write", parameters: { type: "object" } } }], max_tokens: 100 };
@@ -41,7 +41,27 @@ test("tool turns keep affinity; credentials are isolated; protocol time refresh 
   const id = sessions.get(a, 1000000);
   expect(sessions.get(a, 1001000)).toBe(id);
   expect(sessions.get(new Headers({ authorization: "Bearer second", "x-opencode-session": "conversation" }), 1001000)).not.toBe(id);
-  expect(sessions.get(a, 1240000)).not.toBe(id);
+  expect(sessions.get(a, 1000000 + 12 * 60 * 60 * 1000 - 1)).toBe(id);
+  expect(sessions.get(a, 1000000 + 12 * 60 * 60 * 1000)).not.toBe(id);
+});
+
+test("a canonical session from the relay is preserved instead of rotated", () => {
+  const relaySession = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
+  expect(isForwardableSession(relaySession)).toBe(true);
+  expect(isForwardableSession("ses_" + "f".repeat(26))).toBe(false);
+  const headers = upstreamHeaders(new Headers({
+    authorization: "Bearer fixture",
+    "x-opencode-session": relaySession,
+  }), new Sessions());
+  expect(headers.get("x-opencode-session")).toBe(relaySession);
+  expect(headers.get("x-opencode-session-id")).toBe(relaySession);
+  expect(headers.get("x-session-affinity")).toBe(relaySession);
+  expect(headers.get("x-session-id")).toBe(relaySession);
+});
+
+test("an invalid or missing session still gets a canonical generated id", () => {
+  const headers = upstreamHeaders(new Headers({ authorization: "Bearer fixture" }), new Sessions());
+  expect(headers.get("x-opencode-session")).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
 });
 
 test("network rejection fails over with the same credential/model, and pins the successful route", async () => {

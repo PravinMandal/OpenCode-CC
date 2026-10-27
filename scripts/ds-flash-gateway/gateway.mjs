@@ -55,6 +55,17 @@ export function normalize(body) {
   return JSON.stringify(parsed);
 }
 
+// Canonical OpenCode session shape. The Go relay already synthesizes fresh,
+// non-hex sessions in 12-hour buckets; preserve those instead of replacing the
+// relay's stable affinity with a helper-local timestamp. Hash-shaped all-hex
+// ids are the old spoof the free-tier gate rejects.
+const canonicalSession = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const hexOnlySession = /^ses_[0-9a-f]{26}$/;
+export function isForwardableSession(value) {
+  const session = typeof value === "string" ? value.trim() : "";
+  return canonicalSession.test(session) && !hexOnlySession.test(session);
+}
+
 export class Sessions {
   entries = new Map();
   scope(headers) {
@@ -69,9 +80,12 @@ export class Sessions {
   get(headers, now = Date.now()) {
     const scope = this.scope(headers);
     let entry = this.entries.get(scope);
-    // Keep tool turns sticky. Refresh protocol timestamps independently of
-    // response status; this never clears any account/network quota state.
-    if (!entry || now - entry.created >= 240000) {
+    // Keep generated sessions sticky for the same window the Go relay uses
+    // for forwardable downstream sessions. Upstream free-tier quota is
+    // accounted per session, so minting a new one every few minutes burns
+    // through the lane instead of refreshing it. A session supplied by the
+    // relay is preserved separately by upstreamHeaders().
+    if (!entry || now - entry.created >= 12 * 60 * 60 * 1000) {
       const inv = (~((BigInt(now) << 12n) | 1n)) & 0xffffffffffffn;
       const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
       const session = "ses_" + inv.toString(16).padStart(12, "0") +
@@ -92,7 +106,9 @@ export function upstreamHeaders(incoming, sessions) {
   }
   if (!headers.get("x-opencode-project") || headers.get("x-opencode-project") === "global")
     headers.set("x-opencode-project", createHash("sha1").update("opencode-cc").digest("hex"));
-  const session = sessions.get(headers);
+  const incomingSession = headers.get("x-opencode-session") || headers.get("x-opencode-session-id")
+    || headers.get("x-session-affinity") || headers.get("x-session-id");
+  const session = isForwardableSession(incomingSession) ? incomingSession.trim() : sessions.get(headers);
   for (const key of ["x-opencode-session", "x-opencode-session-id", "x-session-affinity", "x-session-id"])
     headers.set(key, session);
   return headers;
