@@ -1,16 +1,17 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Kiowx/opencode-cc/internal/api"
 	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/Kiowx/opencode-cc/internal/native"
 	"github.com/Kiowx/opencode-cc/internal/proxy"
 	"github.com/Kiowx/opencode-cc/internal/store"
 )
@@ -21,6 +22,7 @@ type Server struct {
 	cfg          *config.Config
 	store        *store.Store
 	httpClient   *http.Client
+	native       *native.Manager
 	srv          *http.Server
 	effortLevels *EffortLevelsCache
 	cooldowns    *cooldownTracker
@@ -45,6 +47,7 @@ func New(cfg *config.Config, st *store.Store) *Server {
 		effortLevels: LoadEffortLevelsCache(dataDir),
 		cooldowns:    newCooldownTracker(),
 		done:         make(chan struct{}),
+		native:       native.New(native.Options{DataDir: dataDir}),
 		httpClient: &http.Client{
 			Timeout: 0, // streaming: no global timeout (per-request override used)
 			Transport: &http.Transport{
@@ -93,7 +96,7 @@ func New(cfg *config.Config, st *store.Store) *Server {
 			},
 		},
 	}
-	s.httpClient.Transport = newDSFlashTransport(s.httpClient.Transport, os.Getenv("OPENCODE_CC_DS_FLASH_FETCH_URL"))
+	s.httpClient.Transport = newNativeTransport(s.httpClient.Transport, s.native)
 	return s
 }
 
@@ -151,6 +154,13 @@ func (s *Server) panelPlaceholder(w http.ResponseWriter, r *http.Request) {
 
 // Start begins serving. It blocks until Shutdown is called.
 func (s *Server) Start(handler http.Handler) error {
+	if s.native != nil {
+		// Bounded: a sidecar that is slow or broken must not keep the paid
+		// routes offline. Free requests get a clear 503 until it is ready.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		s.native.Start(ctx)
+		cancel()
+	}
 	s.srv = &http.Server{
 		Addr:              s.cfg.Snapshot().ListenAddr,
 		Handler:           handler,
@@ -172,6 +182,9 @@ func (s *Server) Shutdown() error {
 			close(s.done)
 		}
 	})
+	if s.native != nil {
+		s.native.Stop()
+	}
 	if s.srv == nil {
 		return nil
 	}

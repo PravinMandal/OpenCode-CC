@@ -127,12 +127,33 @@
   measured free-route input ceiling is about 261K.
 
 
-## DS V4.1 Flash Free deployed repair (2026-10-24)
+## Native free-tier transport (supersedes the 2026-10-24 DS helper)
+
+- Free models are carried in-process: `internal/native` starts one Bun child on
+  an ephemeral loopback port with a per-process token, and
+  `internal/server/native_transport.go` routes every `proxy.IsFreeModel`
+  request through it. Full details: `docs/setup/NATIVE_FREE_TIER.md`.
+- `opencode-native.service`, `opencode-cc-ds-flash.service` and the
+  `:18790`/`:18791` listeners are retired. Do not recreate them or a
+  `ds-flash.conf` drop-in; `OPENCODE_CC_DS_FLASH_FETCH_URL` is no longer read.
+- The Bun hop is not optional: the same request returns 200 from Bun and 429
+  from Go, Node, Python or curl. Do not "simplify" it into the Go transport.
+- The free tier accepts the stock 13 OpenCode tools plus at most 6 client tools
+  (19 total). The sidecar trims extras and retries canonical-only once on a
+  shape 429; quota rotation only happens when a stock probe also fails.
+- OpenCode CLI and T3 OpenCode stay direct to opencode.ai. CPA fronts Claude,
+  Codex, Antigravity and LFM3 only. CPA has exactly one `opencode-cc` Claude
+  provider, and both free aliases (`oc/...`) live on it.
+- `~/.local/bin/claude-t3` is the T3 Claude launcher. It rewrites
+  `--tools default` to a lean set and adds `--strict-mcp-config` for free
+  models only; it never routes traffic.
+
+Historical notes from the retired helper, kept for evidence — not instructions:
 
 - DS Flash monitoring cadence: the user requested a fixed 60-minute interval to conserve usage (2026-10-25). Keep the existing watcher hourly, including after failures; this supersedes its former adaptive cadence. Preserve the authorized deadline and repair scope.
 
-- Production `opencode-cc.service` enables `OPENCODE_CC_DS_FLASH_FETCH_URL` via its `ds-flash.conf` drop-in. Only the exact Zen `deepseek-v4.1-flash-free` Chat request uses the dedicated Bun compatibility transport; other models/origins keep their existing path.
-- `opencode-cc-ds-flash.service` is enabled on **18790**. This is now a production helper: never reuse that port for staging. Source, audited prelude, license, runtime recipe and rollback instructions: `scripts/ds-flash-gateway/`. Runtime selection: `~/.local/lib/opencode-cc-ds-flash/current`.
+- Production `opencode-cc.service` enabled `OPENCODE_CC_DS_FLASH_FETCH_URL` via a `ds-flash.conf` drop-in. Only the exact Zen `deepseek-v4.1-flash-free` Chat request used the dedicated Bun compatibility transport; other models/origins kept their existing path.
+- `opencode-cc-ds-flash.service` was enabled on **18790**. That port is now retired; never reuse it for staging. Source, audited prelude, license, runtime recipe and rollback instructions remain under `scripts/ds-flash-gateway/` as history.
 - The helper retains client instructions, tools and history after the pinned OpenCode prelude, normalizes project/session metadata, and automatically selects phone/direct egress. All-route failure may trigger one authorized Telegram phone reset per 30 minutes. It stores no provider credentials and never switches model/account or clears genuine quota/cooldown state.
 - The exact Claude → CPA `deepseek-v4.1-flash-oc` → relay → Zen chain passed real Write/Read tasks for the supplied key and active OAuth account, brief and 195-second outages, and same-CPA-process recovery. Production file-tool proof: relay request IDs 32178–32180, all 200 on the free model.
 - Updating the prelude/transport requires the real harness tests again. Use `scripts/test_ds_flash_chain.py` with isolated 18789/18319/18794; preserve the same CPA process for outage/recovery. Keep the normal staged/atomic deployment procedure and do not stop Morph.

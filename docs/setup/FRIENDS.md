@@ -13,14 +13,22 @@ The exact tested chain is:
 
 ```text
 Claude Code -- deepseek-v4.1-flash-oc --> CLIProxyAPI :8317 (patched)
-  --> opencode-cc :8787 -- deepseek-v4.1-flash-free --> Bun helper :18790
-  --> phone HTTP CONNECT :18889 OR direct laptop Internet --> OpenCode Zen
+  --> opencode-cc :8787 -- free models --> Bun sidecar (ephemeral loopback port)
+  --> OpenCode Zen
 
 Other models: opencode-cc Go transport --> its configured HTTPS_PROXY / NO_PROXY
 Optional WARP: selected application --> SOCKS5 :40000 --> Cloudflare --> Internet
 Phone route: :18889 --> isolated userspace Tailscale --> Android exit node --> cellular
 Telegram control: local script --> Bot API --> phone automation --> cellular reset
 ```
+
+> **Superseded (November 2026):** the separate DS Flash helper service and the
+> fixed `:18790` listener are retired in this fork. `opencode-cc` now owns one
+> Bun sidecar on an ephemeral loopback port and routes every `-free` model
+> through it. New installs do not need `opencode-cc-ds-flash.service` or the
+> `ds-flash.conf` drop-in. See
+> [Native free-tier transport](NATIVE_FREE_TIER.md). The helper instructions
+> later in this guide are retained as history for older deployments.
 
 **Ready for a technical friend's supervised installation, not a turnkey or
 unlimited free service.** Use your own account, key, phone, tailnet and bot. A
@@ -40,7 +48,7 @@ container chain or second physical laptop installation was tested.
 | Component | Included here | Friend must supply |
 |---|---|---|
 | Go relay, web dashboard, translations, auth | Source and tests | Go 1.24+, Node 20+/npm to build UI |
-| Exact DS Flash compatibility helper | `scripts/ds-flash-gateway/`, pinned prelude + MIT notice | Bun; validated production version 1.4.2 |
+| Free-tier Bun sidecar | Embedded in `opencode-cc` (`internal/native/`) | Bun on the machine; the old fixed-port helper is retired |
 | CPA retry behavior | `contrib/cliproxyapi/` patch bundle + example config | Upstream v8.0.4 source, Go toolchain requested by its go.mod |
 | Claude Code (optional client) | Acceptance runner and wrappers | Official CLI 2.1.310 for recorded Claude tests; not required for other clients |
 | OpenCode account | Read-only active credential resolver | Own Zen key or logged-in OpenCode v2; native fixture was 2.1.2 |
@@ -65,7 +73,7 @@ If a required private component is missing, report it and keep its feature off.
 |---|---|
 | 8787 | Production relay; exactly one process |
 | 8317 | Production CPA |
-| 18790 | Production DS helper; loopback only |
+| 18790 | Retired; must not listen (sidecar uses an ephemeral port) |
 | 18889 | Phone HTTP CONNECT proxy; loopback only |
 | 40000 | Optional WARP SOCKS5 proxy |
 | 18789 | Isolated staging relay |
@@ -75,13 +83,13 @@ If a required private component is missing, report it and keep its feature off.
 
 ```bash
 ss -ltnp
-systemctl --user status opencode-cc opencode-cc-ds-flash cliproxyapi --no-pager
+systemctl --user status opencode-cc cliproxyapi --no-pager
 ```
 
 Check ports before starting. Acceptance reserves 18789/18319/18794 and refuses
-occupied ports. The helper and relay have separate config; changing the relay
-listen address does not move the helper. No public hostname or Cloudflare Worker
-is required for this laptop installation.
+occupied ports. The relay owns its Bun sidecar; there is no separate helper
+config or listener. No public hostname or Cloudflare Worker is required for this
+laptop installation.
 
 ## 3. Build the fork and install privately
 

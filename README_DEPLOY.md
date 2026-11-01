@@ -14,9 +14,10 @@ Do not use old copied deployment snippets. In particular:
   `require_api_key=true`. Create CPA/client keys in the panel.
 - Explicitly pass `-data` in the service. The reference data is `~/data`, and
   enabled saved `upstreams` entries override legacy env upstream/key settings.
-- DS helper source and service: `scripts/ds-flash-gateway/`. Production helper
-  uses :18790; new installs start direct-only with auto-reset off. See the guide
-  before enabling phone egress or Telegram resets.
+- Free-tier transport: `internal/native/` owns a Bun sidecar on an ephemeral
+  loopback port. The old `:18790` helper, its unit and its `ds-flash.conf`
+  drop-in are retired. See
+  [docs/setup/NATIVE_FREE_TIER.md](docs/setup/NATIVE_FREE_TIER.md).
 - Exact CPA recovery requires the local patch bundle in `contrib/cliproxyapi/`.
 - WARP is optional SOCKS5 :40000 in local proxy mode. Phone :18889 is HTTP
   CONNECT. The Bun helper explicitly uses phone/direct, not the Go relay's
@@ -30,9 +31,9 @@ production settings just because new-install examples use safer defaults.
 1. Check `git status` so the deployed source is known.
 2. `go build ./... && go test ./...`; build `/tmp/opencode-cc-stage`.
 3. Check listeners. Stage on **18789 only when free**, isolated data/config.
-   **18787 is Morph; 18790 is the production helper.** Never stop those to
-   free a test port. Use `scripts/test_ds_flash_chain.py` for the exact CPA
-   alias/file tools, brief and sustained outages and same-process recovery.
+   **18787 is Morph; 18790 is retired.** Never stop those to free a test port.
+   Use `scripts/test_ds_flash_chain.py` for the exact CPA alias/file tools,
+   brief and sustained outages and same-process recovery.
 4. When staging is green, back up current private config/binary, stop only
    `opencode-cc.service`, install to `~/.local/bin/opencode-cc.new` (0755),
    atomically rename over `~/.local/bin/opencode-cc`, start the unit. Morph also

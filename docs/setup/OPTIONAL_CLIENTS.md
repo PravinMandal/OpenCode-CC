@@ -12,7 +12,7 @@ The exact recovery-tested route below uses **patched CPA**:
 Terminal Claude OR T3 Code's Claude provider
   -> CPA :8317, alias deepseek-v4.1-flash-oc
   -> relay :8787, model deepseek-v4.1-flash-free
-  -> Bun :18790 -> configured phone/direct egress -> Zen
+  -> Bun sidecar (ephemeral loopback port, owned by opencode-cc) -> Zen
 ```
 
 All `127.0.0.1` addresses refer to the machine **running the agent process**.

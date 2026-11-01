@@ -207,14 +207,16 @@ docker compose up -d --build
 ```
 
 These commands provide the Go relay/dashboard only. Configure your own Zen key
-in the protected panel. For the exact DS Flash Free compatibility and recovery
-chain, use the [native Linux setup](docs/setup/FRIENDS.md): the Dockerfile does
-not include Bun, CPA, phone egress or Telegram automation. Container loopback
-is not the host's loopback; `127.0.0.1:18790` / `:18889` / `:40000` in a container
-will not reach host services without deliberate network configuration. Active
-OpenCode OAuth also requires its private database to be available read-only
-inside the container. This combined container setup has not been accepted here.
-Do not expose the panel publicly or paste real credentials into shell history.
+in the protected panel. For free-tier models, `opencode-cc` also needs Bun on
+the host to run its sidecar; see the [native Linux setup](docs/setup/FRIENDS.md)
+and [Native free-tier transport](docs/setup/NATIVE_FREE_TIER.md). The Dockerfile
+does not include Bun, CPA, phone egress or Telegram automation. Container
+loopback is not the host's loopback; `127.0.0.1:8317` / `:18889` / `:40000` in a
+container will not reach host services without deliberate network
+configuration. Active OpenCode OAuth also requires its private database to be
+available read-only inside the container. This combined container setup has not
+been accepted here. Do not expose the panel publicly or paste real credentials
+into shell history.
 
 ## How Translation Works
 

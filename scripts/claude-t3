@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# claude-t3: Claude Code launcher for T3 Code.
+#
+# T3 asks the Claude Agent SDK for the `claude_code` tool preset, which makes
+# the CLI send ~85 tools (~73 KB). The Zen free tier accepts the stock 13
+# OpenCode tools plus only a few client tools (19 total measured), so a free
+# model rejects that surface before the turn starts, and T3's `launchArgs`
+# cannot fix it: the SDK emits `--tools default` before any extra arguments,
+# and a second `--tools` does not replace it.
+#
+# This launcher only rewrites that argument for free models. It never handles
+# traffic: the CLI still talks to CPA exactly as before, and paid models get
+# their arguments untouched.
+#
+# Free models are recognised the same way the rest of the stack recognises
+# them: the `oc/` namespace or a `-free` suffix. Nothing is pinned to today's
+# model names.
+set -euo pipefail
+
+REAL="${CLAUDE_T3_REAL:-$HOME/.local/share/mise/installs/claude/latest/claude}"
+if [ ! -x "$REAL" ]; then
+  REAL="$(command -v claude || true)"
+fi
+if [ -z "$REAL" ] || [ ! -x "$REAL" ]; then
+  echo "claude-t3: real claude binary not found" >&2
+  exit 127
+fi
+
+# The lean surface measured at ~28 KB / 18 tools after the adapter's canonical
+# prefix, comfortably under the free-tier count and character limits. Keep Bash
+# and the file tools: a free model that cannot read or edit is not useful for
+# coding.
+LEAN="Agent,AskUserQuestion,Bash,Edit,Read,ToolSearch,Write"
+
+is_free() {
+  case "${1:-}" in
+    oc/*|*-free|big-pickle|*/big-pickle) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+model=""
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  case "${args[$i]}" in
+    --model) model="${args[$((i + 1))]:-}" ;;
+    --model=*) model="${args[$i]#--model=}" ;;
+  esac
+  i=$((i + 1))
+done
+[ -n "$model" ] || model="${ANTHROPIC_MODEL:-}"
+
+if ! is_free "$model"; then
+  exec "$REAL" "$@"
+fi
+
+out=()
+seen_tools=0
+seen_strict=0
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  case "${args[$i]}" in
+    --tools)
+      out+=(--tools "$LEAN")
+      i=$((i + 2))
+      seen_tools=1
+      ;;
+    --tools=*)
+      out+=(--tools "$LEAN")
+      i=$((i + 1))
+      seen_tools=1
+      ;;
+    --strict-mcp-config)
+      out+=("${args[$i]}")
+      i=$((i + 1))
+      seen_strict=1
+      ;;
+    *)
+      out+=("${args[$i]}")
+      i=$((i + 1))
+      ;;
+  esac
+done
+[ "$seen_tools" -eq 1 ] || out+=(--tools "$LEAN")
+[ "$seen_strict" -eq 1 ] || out+=(--strict-mcp-config)
+
+# One line per trimmed launch, so a future tool-surface regression is visible
+# without turning on Claude Code debug logs.
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/claude-t3/launch.log"
+mkdir -p "$(dirname "$LOG")"
+printf '%s model=%s tools=%s\n' "$(date -Is)" "$model" "$LEAN" >>"$LOG"
+
+exec "$REAL" "${out[@]}"
