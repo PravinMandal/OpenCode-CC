@@ -8,13 +8,17 @@
 # cannot fix it: the SDK emits `--tools default` before any extra arguments,
 # and a second `--tools` does not replace it.
 #
-# This launcher only rewrites that argument for free models. It never handles
-# traffic: the CLI still talks to CPA exactly as before, and paid models get
-# their arguments untouched.
+# This launcher only rewrites client-side arguments. It never handles traffic:
+# the CLI still talks to CPA exactly as before, and paid models get their
+# arguments untouched.
 #
-# Free models are recognised the same way the rest of the stack recognises
-# them: the `oc/` namespace or a `-free` suffix. Nothing is pinned to today's
-# model names.
+# Two model families are trimmed:
+#   * free models (`oc/*`, `*-free`, `big-pickle`) get a lean coding tool set;
+#   * local models (`local/*`) get the smallest useful set, a short system
+#     prompt, low effort and a 16k context hint, because LFM3 runs on CPU with
+#     a 16k window.
+#
+# Nothing is pinned to today's model names.
 set -euo pipefail
 
 REAL="${CLAUDE_T3_REAL:-$HOME/.local/share/mise/installs/claude/latest/claude}"
@@ -26,15 +30,24 @@ if [ -z "$REAL" ] || [ ! -x "$REAL" ]; then
   exit 127
 fi
 
-# The lean surface measured at ~28 KB / 18 tools after the adapter's canonical
-# prefix, comfortably under the free-tier count and character limits. Keep Bash
-# and the file tools: a free model that cannot read or edit is not useful for
-# coding.
-LEAN="Agent,AskUserQuestion,Bash,Edit,Read,ToolSearch,Write"
+# Free models measured ~28 KB / 18 tools after the adapter's canonical prefix,
+# comfortably under the free-tier count and character limits. Keep Bash and the
+# file tools: a free model that cannot read or edit is not useful for coding.
+LEAN_FREE="Agent,AskUserQuestion,Bash,Edit,Read,ToolSearch,Write"
+LEAN_LOCAL="${CLAUDE_T3_LOCAL_TOOLS:-Bash,Read,Write,Edit}"
+LOCAL_CONTEXT="${CLAUDE_T3_LOCAL_CONTEXT:-16384}"
+LOCAL_PROMPT="${CLAUDE_T3_LOCAL_PROMPT:-You are a concise coding agent running locally on this machine. Use the available tools to inspect, edit, and run code. Keep replies short and do not dump large files because the context window is small.}"
 
 is_free() {
   case "${1:-}" in
     oc/*|*-free|big-pickle|*/big-pickle) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_local() {
+  case "${1:-}" in
+    local/*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -51,23 +64,31 @@ while [ "$i" -lt "${#args[@]}" ]; do
 done
 [ -n "$model" ] || model="${ANTHROPIC_MODEL:-}"
 
-if ! is_free "$model"; then
+if is_free "$model"; then
+  mode=free
+  lean="$LEAN_FREE"
+elif is_local "$model"; then
+  mode=local
+  lean="$LEAN_LOCAL"
+else
   exec "$REAL" "$@"
 fi
 
 out=()
 seen_tools=0
 seen_strict=0
+seen_effort=0
+seen_system=0
 i=0
 while [ "$i" -lt "${#args[@]}" ]; do
   case "${args[$i]}" in
     --tools)
-      out+=(--tools "$LEAN")
+      out+=(--tools "$lean")
       i=$((i + 2))
       seen_tools=1
       ;;
     --tools=*)
-      out+=(--tools "$LEAN")
+      out+=(--tools "$lean")
       i=$((i + 1))
       seen_tools=1
       ;;
@@ -76,19 +97,51 @@ while [ "$i" -lt "${#args[@]}" ]; do
       i=$((i + 1))
       seen_strict=1
       ;;
+    --effort)
+      if [ "$mode" = local ]; then
+        out+=(--effort low)
+      else
+        out+=("${args[$i]}" "${args[$((i + 1))]:-}")
+      fi
+      i=$((i + 2))
+      seen_effort=1
+      ;;
+    --effort=*)
+      if [ "$mode" = local ]; then
+        out+=(--effort low)
+      else
+        out+=("${args[$i]}")
+      fi
+      i=$((i + 1))
+      seen_effort=1
+      ;;
+    --system-prompt|--system-prompt=*|--append-system-prompt|--append-system-prompt=*)
+      seen_system=1
+      out+=("${args[$i]}")
+      i=$((i + 1))
+      ;;
     *)
       out+=("${args[$i]}")
       i=$((i + 1))
       ;;
   esac
 done
-[ "$seen_tools" -eq 1 ] || out+=(--tools "$LEAN")
+[ "$seen_tools" -eq 1 ] || out+=(--tools "$lean")
 [ "$seen_strict" -eq 1 ] || out+=(--strict-mcp-config)
+
+if [ "$mode" = local ]; then
+  # LFM3 only advertises a low effort level, and T3's session default is high.
+  [ "$seen_effort" -eq 1 ] || out+=(--effort low)
+  # T3 does not pass a command-line system prompt; replacing the large default
+  # preset is what keeps a 16k local model inside its window.
+  [ "$seen_system" -eq 1 ] || out+=(--system-prompt "$LOCAL_PROMPT")
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$LOCAL_CONTEXT"
+fi
 
 # One line per trimmed launch, so a future tool-surface regression is visible
 # without turning on Claude Code debug logs.
 LOG="${XDG_STATE_HOME:-$HOME/.local/state}/claude-t3/launch.log"
 mkdir -p "$(dirname "$LOG")"
-printf '%s model=%s tools=%s\n' "$(date -Is)" "$model" "$LEAN" >>"$LOG"
+printf '%s model=%s mode=%s tools=%s\n' "$(date -Is)" "$model" "$mode" "$lean" >>"$LOG"
 
 exec "$REAL" "${out[@]}"

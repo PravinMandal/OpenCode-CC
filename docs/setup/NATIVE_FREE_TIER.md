@@ -194,9 +194,10 @@ codex exec --profile cliproxyapi-deepseek-free --skip-git-repo-check "Reply with
 ```
 
 For T3 Claude, the configured binary is `~/.local/bin/claude-t3`
-(`install -m 0755 scripts/claude-t3 ~/.local/bin/claude-t3`). It only rewrites
+(`install -m 0755 scripts/claude-t3 ~/.local/bin/claude-t3`). It rewrites
 `--tools default` to a lean set and adds `--strict-mcp-config` for free models;
-it never routes traffic. Paid models pass through untouched.
+local models get a four-tool set, a short system prompt, low effort and a 16k
+context hint. Paid models pass through untouched, and it never routes traffic.
 
 ## Known limits
 

@@ -146,7 +146,8 @@
   provider, and both free aliases (`oc/...`) live on it.
 - `~/.local/bin/claude-t3` is the T3 Claude launcher. It rewrites
   `--tools default` to a lean set and adds `--strict-mcp-config` for free
-  models only; it never routes traffic.
+  models; local models get a four-tool set, a short prompt, low effort and a
+  16k context hint. It never routes traffic.
 
 Historical notes from the retired helper, kept for evidence — not instructions:
 
