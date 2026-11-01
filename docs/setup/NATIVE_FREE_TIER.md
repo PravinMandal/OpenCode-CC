@@ -199,6 +199,31 @@ For T3 Claude, the configured binary is `~/.local/bin/claude-t3`
 local models get a four-tool set, a short system prompt, low effort and a 16k
 context hint. Paid models pass through untouched, and it never routes traffic.
 
+## Model metadata
+
+Verified 2026-11-01 against `https://opencode.ai/inference/v1/models`, the live
+CPA catalog and each upstream profile. Client metadata should match this table,
+not old guesses:
+
+| Model | Context | Max output | Input | Notes |
+|---|---|---|---|---|
+| `oc/deepseek-v4.1-flash-free` | 200,000 | 32,000 | text, image | effort low/high/max |
+| `oc/glm-5.3-flash-free` | 200,000 | 32,000 | text, image | Zen also advertises video |
+| `ag/gemini-3.8-flash-high` | 1,048,576 | 65,536 | text, image | effort high baked into the ID |
+| `cx/gpt-6-luna` | 500,000 curated (1,000,000 model max) | 128,000 | text, image | Codex profile uses the 500k middle |
+| `local/lfm3-omni-2b` | 16,384 | 4,096 | text, image, audio | llama-swap `--ctx-size 16384` |
+
+Both free models accept images even though the paid-model catalog used to
+advertise text only; the Codex catalog now lists `image` for them.
+
+Claude Code does not read this table. It derives its assumed window from the
+model ID or from `modelPicker[].behavesAs`. The curated rows currently behave
+as `claude-opus-4-8`, so Claude Code assumes a 1M window for every row while
+Zen rejects free-model requests above 200k. Removing `behavesAs` from the free
+rows makes Claude Code assume 200k, at the cost of an "unrecognized model"
+notice and different effort defaults. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` does
+not override a model ID that Claude Code resolves to a known model.
+
 ## Known limits
 
 - The sidecar needs a recent `opencode` on `PATH` to recap its identity when
