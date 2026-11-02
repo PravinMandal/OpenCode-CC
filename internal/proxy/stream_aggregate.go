@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// legacyAggregateFunctionIndex keys fragmented legacy function_call deltas.
+// Upstream tool_calls indexes are always >= 0, so -1 never collides; keeping
+// it stable across chunks merges the fragments into one call.
+const legacyAggregateFunctionIndex = -1
+
 // AggregateOpenAIStream consumes an OpenAI Chat Completions SSE response and
 // returns the equivalent non-streaming response. Zen's free lane requires
 // stream:true upstream, while ordinary SDKs still legitimately ask for a
@@ -20,12 +25,24 @@ func AggregateOpenAIStream(r io.Reader) (*OpenAIResponse, error) {
 		usage              OpenAIUsage
 		tools              = map[int]*OpenAIToolCall{}
 		toolOrder          []int
+		syntheticIndex     = -2
 		sawChunk           bool
 	)
 	appendTool := func(call OpenAIToolCall) {
 		index := call.Index
-		if index < 0 {
-			index = len(toolOrder)
+		if index < 0 && index != legacyAggregateFunctionIndex {
+			index = syntheticIndex
+			syntheticIndex--
+		}
+		// Non-streaming message.tool_calls normally omit index, so every
+		// entry defaults to 0. A different non-empty id/name under an index
+		// already claimed by another call is a second complete call, not a
+		// fragment; park it under a fresh synthetic key instead of merging
+		// its arguments into corrupt JSON.
+		if current, ok := tools[index]; ok && call.ID != "" && current.ID != "" &&
+			call.ID != current.ID && call.Function.Name != "" {
+			index = syntheticIndex
+			syntheticIndex--
 		}
 		current, ok := tools[index]
 		if !ok {
@@ -76,7 +93,7 @@ func AggregateOpenAIStream(r io.Reader) (*OpenAIResponse, error) {
 			}
 			if choice.Delta.FunctionCall != nil {
 				appendTool(OpenAIToolCall{
-					Index:    len(toolOrder),
+					Index:    legacyAggregateFunctionIndex,
 					Type:     "function",
 					Function: *choice.Delta.FunctionCall,
 				})
@@ -117,8 +134,13 @@ func AggregateOpenAIStream(r io.Reader) (*OpenAIResponse, error) {
 	}
 	if len(toolOrder) > 0 {
 		calls := make([]OpenAIToolCall, 0, len(toolOrder))
-		for _, index := range toolOrder {
-			calls = append(calls, *tools[index])
+		for i, index := range toolOrder {
+			call := *tools[index]
+			// Synthetic keys keep complete message calls apart while
+			// aggregating; the final message exposes clean sequential
+			// indexes instead of internal negative ones.
+			call.Index = i
+			calls = append(calls, call)
 		}
 		out.Choices[0].Message.ToolCalls = calls
 		if finish == "stop" {

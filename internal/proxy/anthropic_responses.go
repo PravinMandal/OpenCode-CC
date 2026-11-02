@@ -15,6 +15,7 @@ package proxy
 // through.
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -426,11 +427,7 @@ func ConvertResponsesToAnthropicResponse(raw []byte, incomingModel string) (*Ant
 		Role:  "assistant",
 		Model: incomingModel,
 	}
-	stop := "end_turn"
-	if in.Status == "incomplete" {
-		stop = "max_tokens"
-	}
-	out.StopReason = &stop
+	hasToolUse := false
 	for _, item := range in.Output {
 		switch item.Type {
 		case "message":
@@ -448,26 +445,39 @@ func ConvertResponsesToAnthropicResponse(raw []byte, incomingModel string) (*Ant
 			if strings.TrimSpace(args) == "" {
 				args = "{}"
 			}
+			if !json.Valid([]byte(args)) {
+				if in.Status == "incomplete" {
+					// A call cut off by the output limit is not
+					// executable; dropping it surfaces max_tokens below.
+					continue
+				}
+				args = "{}"
+			}
 			out.Content = append(out.Content, AnthropicContent{
 				Type: "tool_use", ID: callID, Name: item.Name,
 				Input: jsonRawMessage(args),
 			})
-			toolStop := "tool_use"
-			out.StopReason = &toolStop
+			hasToolUse = true
 		default:
 			// reasoning summaries and anything else are dropped.
 			continue
 		}
 	}
-	if in.Usage != nil {
-		out.Usage = AnthropicUsageFromOpenAI(in.Usage.InputTokens, in.Usage.InputTokensDetails.CachedTokens, in.Usage.OutputTokens)
-	}
-	if out.StopReason != nil && *out.StopReason == "tool_use" {
-		// keep tool_use even on incomplete streams; max_tokens only wins
-		// when no tool call was produced.
-	} else if in.Status == "incomplete" {
+	switch {
+	case hasToolUse:
+		// A complete call keeps tool_use even on an incomplete stream;
+		// max_tokens only wins when no call survived.
+		toolStop := "tool_use"
+		out.StopReason = &toolStop
+	case in.Status == "incomplete":
 		maxStop := "max_tokens"
 		out.StopReason = &maxStop
+	default:
+		endStop := "end_turn"
+		out.StopReason = &endStop
+	}
+	if in.Usage != nil {
+		out.Usage = AnthropicUsageFromOpenAI(in.Usage.InputTokens, in.Usage.InputTokensDetails.CachedTokens, in.Usage.OutputTokens)
 	}
 	return out, nil
 }

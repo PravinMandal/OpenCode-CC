@@ -268,6 +268,30 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 	}
 
 	for _, ch := range chunk.Choices {
+		// Some OpenAI-compatible gateways deliver the completed answer in a
+		// choice.message object even on SSE. Treat it like the equivalent
+		// delta: stream text/reasoning and buffer tool calls for Finalize.
+		// Skip it when delta content is also present so a chunk carrying
+		// both shapes can never double-emit.
+		if ch.Message != nil && ch.Delta.ReasoningContent == "" && ch.Delta.Content == "" &&
+			len(ch.Delta.ToolCalls) == 0 && ch.Delta.FunctionCall == nil {
+			if ch.Message.ReasoningContent != "" {
+				if err := c.handleThinking(ch.Message.ReasoningContent); err != nil {
+					return err
+				}
+			}
+			if txt := messageContentString(ch.Message); txt != "" {
+				if err := c.handleText(txt); err != nil {
+					return err
+				}
+			}
+			for _, tc := range ch.Message.ToolCalls {
+				c.bufferTool(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
+			}
+			if ch.Message.FunctionCall != nil {
+				c.bufferTool(legacyFunctionCallIndex, "", ch.Message.FunctionCall.Name, ch.Message.FunctionCall.Arguments)
+			}
+		}
 		// 1. reasoning_content is provider-required hidden thinking state.
 		// Emit it as an Anthropic thinking block so Claude Code can replay it
 		// on the next request without mixing it into user-visible text.
@@ -294,8 +318,10 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 		if ch.Delta.FunctionCall != nil {
 			c.bufferTool(legacyFunctionCallIndex, "", ch.Delta.FunctionCall.Name, ch.Delta.FunctionCall.Arguments)
 		}
-		// 4. Role-only first delta (no content) — nothing to emit.
-		if ch.Delta.Role != "" && ch.Delta.Content == "" &&
+		// 4. Role-only first delta (no content) — nothing to emit. A
+		// message-shaped chunk was already handled above, including its
+		// finish_reason, so it must not take this early exit.
+		if ch.Message == nil && ch.Delta.Role != "" && ch.Delta.Content == "" &&
 			len(ch.Delta.ToolCalls) == 0 && ch.Delta.FunctionCall == nil {
 			continue
 		}
@@ -437,6 +463,22 @@ func (c *StreamConverter) emitBufferedTool(st *pendingChatTool) error {
 	if name == "" {
 		return nil
 	}
+	// input_json_delta fragments must concatenate to valid JSON. A call cut
+	// off by the token limit is not a real invocation: drop it so the turn
+	// reports max_tokens, matching ConvertResponse. Corrupt arguments on a
+	// non-truncated turn fall back to {} rather than poisoning the client.
+	if args != "" && !json.Valid([]byte(args)) {
+		if c.pendingFinish == "length" {
+			c.droppedCalls = append(c.droppedCalls, droppedCall{
+				Name: name, CallID: st.id,
+				ArgsLen: len(args), ArgsHead: cappedString(args, 160),
+				Reason:   "truncated-args",
+				Declared: cappedDeclaredNames(c.allowedNames),
+			})
+			return nil
+		}
+		args = "{}"
+	}
 	normalised := ensureToolID(st.id)
 	idx := c.nextIdx
 	c.nextIdx++
@@ -517,10 +559,15 @@ func (c *StreamConverter) Finalize(stopReason string) error {
 	if reason == "" {
 		reason = "stop"
 	}
-	if c.acceptedToolCall && reason == "stop" {
-		reason = "tool_calls"
-	}
-	if (reason == "tool_calls" || reason == "function_call") && !c.acceptedToolCall {
+	if c.acceptedToolCall {
+		// An emitted tool_use block must be advertised as tool_use; clients
+		// key execution off stop_reason. Unknown and content_filter upstream
+		// finishes used to fall through to end_turn and strand the call. A
+		// length stop keeps max_tokens, matching the non-streaming converter.
+		if reason != "length" {
+			reason = "tool_calls"
+		}
+	} else if reason == "tool_calls" || reason == "function_call" {
 		// Upstream promised tool calls but every one was dropped: report
 		// end_turn (the client has nothing to execute) — but the drops are
 		// recorded in DroppedCalls for the server log, never silent.
