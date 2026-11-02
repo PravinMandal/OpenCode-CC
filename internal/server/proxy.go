@@ -1046,7 +1046,6 @@ func encodeLoggedHeaders(h http.Header) string {
 	return truncate(b.String(), maxLoggedHeaderBytes)
 }
 
-
 func (s *Server) shouldLog() bool {
 	s.cfg.RLock()
 	defer s.cfg.RUnlock()
@@ -1106,11 +1105,16 @@ func filterUndeclaredToolUses(resp *proxy.AnthropicResponse, tools []proxy.Anthr
 			// rewrite to the declared equivalent instead of stalling the
 			// agent loop with a text-only end_turn.
 			name, ok := proxy.ResolveDeclaredToolName(block.Name, declared)
-			if !ok {
+			if ok {
+				block.Input = json.RawMessage(proxy.TranslateToolArguments(block.Name, name, string(block.Input)))
+				block.Name = name
+			} else if fbName, fbArgs, fbOK := proxy.SearchFallback(block.Name, string(block.Input), declared); fbOK {
+				block.Name = fbName
+				block.Input = json.RawMessage(fbArgs)
+			} else {
 				removed = append(removed, block.Name)
 				continue
 			}
-			block.Name = name
 		}
 		filtered = append(filtered, block)
 	}
@@ -1118,6 +1122,27 @@ func filterUndeclaredToolUses(resp *proxy.AnthropicResponse, tools []proxy.Anthr
 	if len(removed) > 0 && resp.StopReason != nil && *resp.StopReason == "tool_use" {
 		stop := "end_turn"
 		resp.StopReason = &stop
+	}
+	if len(removed) > 0 {
+		hasText := false
+		for _, block := range resp.Content {
+			if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+				hasText = true
+				break
+			}
+		}
+		if !hasText {
+			declaredList := strings.Join(declared, ", ")
+			if len(declaredList) > 300 {
+				declaredList = declaredList[:300] + "…"
+			}
+			resp.Content = append(resp.Content, proxy.AnthropicContent{
+				Type: "text",
+				Text: fmt.Sprintf(
+					"[opencode-cc] Dropped tool call(s) %s: this client did not declare them, so they could not run. Declared: %s. See the proxy log event tool_contract_gap.",
+					strings.Join(removed, ", "), declaredList),
+			})
+		}
 	}
 	return removed
 }

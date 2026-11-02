@@ -512,7 +512,17 @@ func (c *ResponsesToAnthropicStreamer) flushTool(itemID string) error {
 		}
 	} else if c.allowed != nil {
 		resolved, ok := ResolveDeclaredToolName(p.name, c.allowedNames)
-		if !ok {
+		if ok {
+			if resolved != p.name {
+				c.renamedToolCalls++
+			}
+			args = TranslateToolArguments(p.name, resolved, args)
+			emitName = resolved
+		} else if fbName, fbArgs, fbOK := SearchFallback(p.name, args, c.allowedNames); fbOK {
+			// Grep/Glob not declared: keep search working through Bash.
+			emitName, args = fbName, fbArgs
+			c.renamedToolCalls++
+		} else {
 			// Undeclared (e.g. a hallucinated tool): drop, but record the
 			// full shape so the server layer can log WHY.
 			drop := p.describeDrop()
@@ -521,10 +531,6 @@ func (c *ResponsesToAnthropicStreamer) flushTool(itemID string) error {
 			c.droppedCalls = append(c.droppedCalls, drop)
 			return nil
 		}
-		if resolved != p.name {
-			c.renamedToolCalls++
-		}
-		emitName = resolved
 	}
 	if emitName == "" {
 		return nil

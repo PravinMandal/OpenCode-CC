@@ -432,7 +432,20 @@ func (c *StreamConverter) emitBufferedTool(st *pendingChatTool) error {
 	name := st.name
 	if name != "" && c.restrictTools {
 		resolved, ok := ResolveDeclaredToolName(name, c.allowedNames)
-		if !ok {
+		if ok {
+			if resolved != name {
+				c.renamedToolCalls++
+			}
+			// The model saw the canonical OpenCode schema; the client
+			// executes its own. Rewrite argument keys (path->file_path,
+			// id->skill, ...) so the call is valid where it runs.
+			args = TranslateToolArguments(name, resolved, args)
+			name = resolved
+		} else if fbName, fbArgs, fbOK := SearchFallback(name, args, c.allowedNames); fbOK {
+			// Grep/Glob not declared: keep search working through Bash.
+			name, args = fbName, fbArgs
+			c.renamedToolCalls++
+		} else {
 			c.droppedCalls = append(c.droppedCalls, droppedCall{
 				Name: name, CallID: st.id,
 				ArgsLen: len(args), ArgsHead: cappedString(args, 160),
@@ -441,10 +454,6 @@ func (c *StreamConverter) emitBufferedTool(st *pendingChatTool) error {
 			})
 			return nil
 		}
-		if resolved != name {
-			c.renamedToolCalls++
-		}
-		name = resolved
 	}
 	if name == "" {
 		recovered, reason := MatchNamelessTool(args, c.allowedNames, c.declaredSchemas)
@@ -511,6 +520,53 @@ func (c *StreamConverter) emitBufferedTool(st *pendingChatTool) error {
 	})
 }
 
+// emitDropNotice writes a visible text block when every tool call in the turn
+// was dropped and the model produced no text. Without it the client sees a
+// thinking-only end_turn, injects a synthetic continuation, and the model
+// retries the same drop: a stall loop with no user-visible cause.
+func (c *StreamConverter) emitDropNotice() error {
+	seen := map[string]bool{}
+	var names []string
+	for _, d := range c.droppedCalls {
+		if d.Name == "" || seen[d.Name] {
+			continue
+		}
+		seen[d.Name] = true
+		names = append(names, d.Name)
+	}
+	label := "a tool call"
+	if len(names) > 0 {
+		label = strings.Join(names, ", ")
+	}
+	text := fmt.Sprintf(
+		"\n\n[opencode-cc] Dropped tool call(s) %s: this client did not declare them, so they could not run. Declared: %s. The turn ended here instead of stalling; see the proxy log event tool_contract_gap.",
+		label, cappedDeclaredNames(c.allowedNames))
+	idx := c.nextIdx
+	c.nextIdx++
+	empty := ""
+	if err := c.writeEvent("content_block_start", streamContentBlockStart{
+		Type:  "content_block_start",
+		Index: idx,
+		ContentBlock: streamContentRef{
+			Type: "text",
+			Text: &empty,
+		},
+	}); err != nil {
+		return err
+	}
+	if err := c.writeEvent("content_block_delta", streamContentBlockDelta{
+		Type:  "content_block_delta",
+		Index: idx,
+		Delta: streamDelta{Type: "text_delta", Text: text},
+	}); err != nil {
+		return err
+	}
+	return c.writeEvent("content_block_stop", streamContentBlockStop{
+		Type:  "content_block_stop",
+		Index: idx,
+	})
+}
+
 // cappedString truncates s for diagnostics so tool payloads (possibly file
 // contents) never flood the log.
 func cappedString(s string, n int) string {
@@ -566,6 +622,18 @@ func (c *StreamConverter) Finalize(stopReason string) error {
 		// length stop keeps max_tokens, matching the non-streaming converter.
 		if reason != "length" {
 			reason = "tool_calls"
+		}
+	} else if reason != "length" && len(c.droppedCalls) > 0 && c.textHead.Len() == 0 {
+		// Every call was dropped and the model produced no visible text.
+		// This is the exact shape that used to surface as a thinking-only
+		// end_turn: Claude Code then injects "no visible output, please
+		// continue", the model retries the same dropped call, and the turn
+		// stalls in a loop. Say what happened instead.
+		if err := c.emitDropNotice(); err != nil {
+			return err
+		}
+		if reason == "tool_calls" || reason == "function_call" {
+			reason = "stop"
 		}
 	} else if reason == "tool_calls" || reason == "function_call" {
 		// Upstream promised tool calls but every one was dropped: report
