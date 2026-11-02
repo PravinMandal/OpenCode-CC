@@ -7,11 +7,12 @@
 # system prompt, low effort and a 16k context hint.
 #
 # Everything else -- paid (cx/*, ag/*) and free (oc/*) -- is exec'd untouched.
-# Free models do not need help here: the opencode-cc sidecar already trims every
-# free request to the 13 canonical OpenCode tools plus at most 6 client tools,
-# which is the free tier's measured limit. Measured on this machine on
-# 2026-11-02: the stock CLI surface is trimmed to 19 tools and the turn
-# succeeds, so shaping it here as well only changed which tools got dropped.
+# Free models do not need help here: the opencode-cc sidecar replaces the client
+# tool surface with the 13 canonical OpenCode tools and translates each call
+# back to the client's own tool name and arguments, so shaping here would only
+# duplicate the proxy. Measured on this machine on 2026-11-02: the stock CLI
+# surface goes in, the sidecar sends canonical-only, and Bash/Skill/Read/Edit
+# turns all succeed.
 #
 # This launcher only rewrites client-side arguments. It never handles traffic.
 set -euo pipefail
