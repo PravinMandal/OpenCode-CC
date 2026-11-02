@@ -10,9 +10,10 @@
 //
 // This layer makes the request look exactly like a stock opencode CLI request:
 // canonical system prompt, canonical tool prefix, stock headers and session
-// shape, SSE, and per-IP quota recovery.
+// shape, and SSE. A 429 is surfaced as-is: quota recovery is a manual operator
+// decision, never an automatic probe, retry or egress rotation.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -35,7 +36,7 @@ const MAX_BODY = 32 * 1024 * 1024;
 // The free tier's tool-schema gate is measured, not documented: through this
 // bridge 37,381 chars of tools answers 200 while 39,588 gets the generic
 // FreeUsageLimitError. Reject oversized surfaces here so callers see the real
-// reason instead of a quota error that triggers credential rotation.
+// reason instead of a quota error that looks like budget exhaustion.
 const MAX_TOOL_CHARS = Number(process.env.BRIDGE_MAX_TOOL_CHARS || 38000);
 // A 100k-token context with reasoning can take well over 30s to first byte on a
 // free-tier queue; aborting at 30s turned slow-but-fine turns into ECONNRESETs.
@@ -47,32 +48,27 @@ const MAX_INFLIGHT = Number(process.env.BRIDGE_MAX_INFLIGHT || 8);
 // answers with an instant 429, so space the starts out instead of firing a
 // parallel burst at it.
 const MIN_START_GAP_MS = Number(process.env.BRIDGE_MIN_START_GAP_MS || 400);
-const RESET_ENGINE = process.env.BRIDGE_RESET_ENGINE || join(HOME, ".config", "opencode", "scripts", "request-reset.mjs");
-// systemd gives this unit a bare PATH, so resolve node by absolute path first.
-const NODE_BIN = [
-  process.env.BRIDGE_NODE,
-  join(HOME, ".local", "share", "mise", "installs", "node", "latest", "bin", "node"),
-  "/usr/bin/node",
-].find(p => p && existsSync(p)) || "node";
-const FREE_LIMIT = /free usage limit/i;
-const MAX_RECOVERY_ATTEMPTS = Number(process.env.BRIDGE_MAX_RECOVERY || 2);
-// Measured on 2026-11-01: the free tier accepts the stock 13 OpenCode tools
-// plus at most 6 client tools (19 total). A 20-tool request is answered with
-// FreeUsageLimitError even when the stock probe on the same /64 succeeds, so
-// the gate is the tool set, not the budget or the character count.
+// The free tier accepts the captured stock tool set; any extra tool name makes
+// the request look like an unknown client and comes back as
+// FreeUsageLimitError even when budget remains. Keep client-only tools out of
+// the wire by default. Capability is not lost: the Go layer translates the
+// canonical call to the client's own tool (shell->Bash, read->Read, skill->
+// Skill, plus argument keys). Set BRIDGE_CLIENT_TOOL_EXTRAS=1 only to
+// experiment with a model whose gate is known to accept extras.
+const CLIENT_TOOL_EXTRAS = process.env.BRIDGE_CLIENT_TOOL_EXTRAS === "1";
+// Upper bound for the opt-in extras experiment, including the canonical set.
 const MAX_TOOLS = Number(process.env.BRIDGE_MAX_TOOLS || 19);
 // Opt-in request capture for diagnosing shape rejections. Off in production.
 const TRACE_DIR = process.env.BRIDGE_TRACE_DIR || "";
-// Circuit breaker: a 429 caused by request *shape* (wrong prompt prefix, stale
-// date, odd tool list) must never cycle the hotspot. One rotation per interval,
-// and only when the last one actually succeeded.
-const RECOVERY_MIN_INTERVAL_MS = Number(process.env.BRIDGE_RECOVERY_INTERVAL_MS || 60_000);
 
 const log = event => console.log(JSON.stringify({ time: new Date().toISOString(), ...event }));
 const sha = v => createHash("sha256").update(v).digest("hex");
 
 let identity = null;
 let inflight = 0;
+// Last client tool-name set reported as suppressed, so a long session logs the
+// decision once instead of on every request.
+let suppressedSignature = "";
 
 // ---------------------------------------------------------------- credentials
 let credential = { value: "", readAt: 0 };
@@ -238,6 +234,30 @@ function upstreamHeaders(inbound) {
 // ---------------------------------------------------------------------- body
 const toolName = tool => tool?.function?.name || tool?.name || "";
 
+// Canonical tool names and their Claude Code equivalents. Used only to avoid
+// paying a free-tier slot twice for one capability: the proxy translates the
+// canonical call back to the client's tool, including argument keys.
+const CLIENT_TO_CANONICAL = {
+  bash: "shell", run_command: "shell",
+  read: "read", read_file: "read",
+  write: "write", write_file: "write",
+  edit: "edit", edit_file: "edit",
+  glob: "glob", grep: "grep",
+  webfetch: "webfetch", websearch: "websearch",
+  skill: "skill", agent: "subagent", task: "subagent",
+  askuserquestion: "question",
+};
+const canonicalToolKey = name =>
+  CLIENT_TO_CANONICAL[String(name || "").toLowerCase()] || "";
+
+// Tools that add capability the canonical set cannot provide. Kept first when
+// the free-tier budget cannot hold every client tool.
+const DEFAULT_CLIENT_TOOL_PRIORITY =
+  "ToolSearch,DeferredToolPlaceholder,ReportFindings,ScheduleWakeup,Workflow,ListAgents";
+const clientToolPriority = () =>
+  (process.env.BRIDGE_CLIENT_TOOL_PRIORITY || DEFAULT_CLIENT_TOOL_PRIORITY)
+    .split(",").map(s => s.trim()).filter(Boolean);
+
 function normalize(raw) {
   const parsed = JSON.parse(raw);
   if (!Array.isArray(parsed.messages) || parsed.messages.length === 0)
@@ -273,25 +293,62 @@ function normalize(raw) {
     if (!parsed.prompt_cache_options) parsed.prompt_cache_options = { mode: "implicit" };
   }
 
-  // Canonical tools come first: their names are part of the cached prefix.
-  // Extra client tools are appended; duplicates keep the canonical definition.
-  // The free tier accepts at most MAX_TOOLS total, so trim extras here rather
-  // than sending a request that is guaranteed a shape 429. Client order is
-  // preserved: a client puts its most important tools first.
+  // Canonical tools only, by default. Their names are part of the cached
+  // prefix, and the free tier treats a different tool set as an unknown client
+  // and answers FreeUsageLimitError. Sending a client's extras therefore costs
+  // an extra upstream request per turn (the retry at the stock shape) and made
+  // every turn 2-3x as expensive. Translation keeps the capability: a canonical
+  // shell/read/skill call is rewritten to the client's Bash/Read/Skill.
   const canonicalTools = identity.tools || [];
   const canonicalNames = new Set(canonicalTools.map(toolName));
-  let extraTools = (parsed.tools || []).filter(t => !canonicalNames.has(toolName(t)));
-  if (canonicalTools.length && extraTools.length > Math.max(0, MAX_TOOLS - canonicalTools.length)) {
+  let extraTools = [];
+  if (CLIENT_TOOL_EXTRAS) {
+    const canonicalKey = canonicalToolKey;
+    const allExtras = (parsed.tools || []).filter(t => !canonicalNames.has(toolName(t)));
+    const isDuplicate = t => {
+      const key = canonicalKey(toolName(t));
+      return Boolean(key) && canonicalNames.has(key);
+    };
+    const priority = clientToolPriority();
+    const rank = t => {
+      const i = priority.indexOf(toolName(t));
+      return i === -1 ? priority.length : i;
+    };
+    const unique = allExtras.filter(t => !isDuplicate(t))
+      .map((t, i) => ({ t, i }))
+      .sort((a, b) => rank(a.t) - rank(b.t) || a.i - b.i)
+      .map(x => x.t);
     const keep = Math.max(0, MAX_TOOLS - canonicalTools.length);
-    log({
-      event: "tools_trimmed", model: parsed.model, canonical: canonicalTools.length,
-      kept: keep, dropped: extraTools.length - keep,
-      // Sample, not the whole list: Codex ships ~90 tools and a full dump
-      // makes the journal unreadable without adding diagnostic value. Names
-      // can legitimately repeat across MCP namespaces, so dedupe the sample.
-      droppedSample: [...new Set(extraTools.slice(keep).map(toolName))].slice(0, 8),
-    });
-    extraTools = extraTools.slice(0, keep);
+    extraTools = unique.slice(0, keep);
+    if (extraTools.length < keep) {
+      const chosen = new Set(extraTools.map(toolName));
+      for (const t of allExtras) {
+        if (extraTools.length >= keep) break;
+        if (chosen.has(toolName(t))) continue;
+        extraTools.push(t);
+        chosen.add(toolName(t));
+      }
+    }
+    if (allExtras.length) {
+      log({
+        event: "tools_extras_applied", model: parsed.model, canonical: canonicalTools.length,
+        kept: extraTools.length, dropped: allExtras.length - extraTools.length,
+      });
+    }
+  } else {
+    const suppressed = (parsed.tools || []).filter(t => !canonicalNames.has(toolName(t)));
+    if (suppressed.length) {
+      const names = [...new Set(suppressed.map(toolName))];
+      const signature = [...names].sort().join(",");
+      if (signature !== suppressedSignature) {
+        suppressedSignature = signature;
+        log({
+          event: "tools_suppressed", model: parsed.model, canonical: canonicalTools.length,
+          dropped: suppressed.length,
+          droppedSample: names.slice(0, 8),
+        });
+      }
+    }
   }
   if (canonicalTools.length) parsed.tools = [...canonicalTools, ...extraTools];
 
@@ -328,7 +385,7 @@ function normalize(raw) {
       `exceeds the free-tier limit of ${MAX_TOOL_CHARS}; trim tools or set BRIDGE_MAX_TOOL_CHARS`);
   }
 
-  return { body: JSON.stringify(parsed), wantsStream, shape, canonicalCount: canonicalTools.length };
+  return { body: JSON.stringify(parsed), wantsStream, shape };
 }
 
 // ------------------------------------------------------------------- routing
@@ -450,94 +507,12 @@ function paceStart() {
   return slot;
 }
 
-// ------------------------------------------------------------ quota recovery
-// The free tier's budget is per public IPv6 /64. When it runs out, the right
-// move is to rotate the prefix and replay the request, not to hand the caller a
-// 429 it will turn into a failed turn. One recovery runs at a time; everybody
-// waiting on it retries afterwards on the new address.
-let recovery = null;
-let lastRecovery = { at: 0, code: null, rotated: false };
-let lastAttemptAt = 0;
-
-async function recoverQuota(reason, force) {
-  if (recovery) return recovery;
-  lastAttemptAt = Date.now();
-  recovery = (async () => {
-    const started = Date.now();
-    log({ event: "recovery_start", reason, force });
-    if (!existsSync(RESET_ENGINE)) {
-      log({ event: "recovery_unavailable", engine: RESET_ENGINE });
-      recovery = null;
-      return false;
-    }
-    try {
-      const proc = Bun.spawn([NODE_BIN, RESET_ENGINE, `--source=opencode-cc`, ...(force ? ["--force"] : [])], {
-        stdout: "pipe", stderr: "pipe", env: process.env,
-      });
-      const killer = setTimeout(() => { try { proc.kill(); } catch {} }, 150_000);
-      const code = await proc.exited;
-      clearTimeout(killer);
-      // request-reset.mjs logs to stdout, not stderr. Exit 0 also covers
-      // "skip: a reset succeeded Ns ago", which is not a rotation: treating it
-      // as one armed the breaker and blocked the real reset for minutes.
-      const out = (await new Response(proc.stdout).text()).trim().slice(-600);
-      const rotated = /\bok via\b/.test(out);
-      if (rotated) lastRecovery = { at: Date.now(), code, rotated };
-      log({ event: "recovery_done", code, rotated, ms: Date.now() - started, out });
-      return rotated;
-    } catch (error) {
-      log({ event: "recovery_failed", error: String(error) });
-      return false;
-    } finally {
-      recovery = null;
-    }
-  })();
-  return recovery;
-}
-
-// Does the free tier still serve a request that looks exactly like the stock
-// client? If yes, the 429 is about this request's shape, not the budget, and
-// rotating the phone's /64 would only drop every other client for ~30s.
-let probeCache = { at: 0, status: null, model: null };
-async function stockProbe(model) {
-  if (probeCache.status !== null && probeCache.model === model && Date.now() - probeCache.at < 15_000)
-    return probeCache.status;
-  let status = -1;
-  try {
-    const body = normalize(JSON.stringify({
-      model, max_tokens: 1, stream: true,
-      messages: [{ role: "user", content: "ok" }],
-    })).body;
-    const response = await fetch(identity.endpoint, {
-      method: "POST", headers: upstreamHeaders({}), body, signal: AbortSignal.timeout(45_000),
-    });
-    status = response.status;
-    await response.text().catch(() => {});
-  } catch (error) {
-    status = -1;
-  }
-  probeCache = { at: Date.now(), status, model };
-  return status;
-}
-
-// canonicalOnlyBody rebuilds a normalized body with just the stock tool
-// prefix. The free tier accepts the stock set on every model, so this is the
-// last resort when a client's extra tools still trip the shape gate.
-function canonicalOnlyBody(raw, canonicalCount) {
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed.tools) || parsed.tools.length <= canonicalCount) return null;
-    parsed.tools = parsed.tools.slice(0, canonicalCount);
-    return JSON.stringify(parsed);
-  } catch {
-    return null;
-  }
-}
-
+// ---------------------------------------------------------------- upstream
+// A 429 is never probed, retried, or “recovered” here. Retrying a
+// FreeUsageLimitError only spends more of the same budget and hid the real
+// state behind automatic rotation, which is an operator-only decision.
 async function upstream(body, inbound, meta) {
   let transportFailures = 0;
-  let recoveryWaits = 0;
-  let shapeRetried = false;
   for (let attempt = 1; ; attempt++) {
     await paceStart();
     const controller = new AbortController();
@@ -573,61 +548,23 @@ async function upstream(body, inbound, meta) {
       return aggregate(response, meta);
     }
 
-    // 429 bodies are tiny: read them to tell "budget gone" apart from "this
-    // request looked unfamiliar", which retry differently.
+    // Free-tier quota. Do not probe the budget, do not retry, do not rotate the
+    // egress: all three are forbidden, and a retry spends the same budget twice.
+    // Surface the provider's own status and Retry-After so the caller knows the
+    // real state.
     const text = await response.text();
-    const exhausted = FREE_LIMIT.test(text);
-    log({ event: "upstream_429", ...meta, attempt, exhausted, body: text.slice(0, 400) });
-    if (exhausted) {
-      const probe = await stockProbe(meta.model);
-      log({ event: "quota_probe", ...meta, attempt, status: probe });
-      const throttled = lastAttemptAt && Date.now() - lastAttemptAt < RECOVERY_MIN_INTERVAL_MS;
-      // Only rotate when the stock shape is rejected too. A shape rejection is
-      // fixed by changing the request, not by cycling the hotspot.
-      if (probe !== 200 && attempt <= MAX_RECOVERY_ATTEMPTS && !throttled) {
-        await recoverQuota(`free-limit attempt ${attempt}`, false);
-        continue;
-      }
-      // The stock probe succeeded, so this is a shape rejection. Retry once
-      // with only the stock tool prefix; some client tool sets trip the gate
-      // even under the character cap.
-      if (probe === 200 && !shapeRetried && meta.canonicalCount > 0 &&
-          (meta.shape?.tools ?? 0) > meta.canonicalCount) {
-        const trimmed = canonicalOnlyBody(body, meta.canonicalCount);
-        if (trimmed) {
-          shapeRetried = true;
-          let toolChars = meta.shape?.toolChars ?? 0;
-          try { toolChars = JSON.stringify(JSON.parse(trimmed).tools).length; } catch {}
-          body = trimmed;
-          meta = { ...meta, shape: { ...meta.shape, tools: meta.canonicalCount, toolChars } };
-          log({ event: "shape_retry", ...meta, attempt, tools: meta.canonicalCount, toolChars });
-          continue;
-        }
-      }
-      // Another request is already rotating. Wait for its result instead of
-      // returning a 429 that the caller would only retry into the same wall.
-      // Bounded, because this loop has no other exit.
-      if (recovery && recoveryWaits < 1) {
-        recoveryWaits++;
-        const rotated = await recovery;
-        if (rotated) continue;
-      }
-      const headers = new Headers({ "content-type": response.headers.get("content-type") || "application/json" });
-      // Never arm a long cooldown in the relay/CPA/proxy layers.
-      headers.set("retry-after", probe === 200 ? "30" : "5");
-      // Tell the Go layer (and a human reading the log) whether this 429 is a
-      // budget wall that needs a new egress prefix, or a request-shape problem
-      // that rotation cannot fix.
-      headers.set("x-oc-native", "1");
-      headers.set("x-oc-reset", probe === 200 ? "shape" : "needed");
-      if (lastRecovery?.at) headers.set("x-oc-reset-last", new Date(lastRecovery.at).toISOString());
-      if (throttled) headers.set("x-oc-reset-throttled", "1");
-      return new Response(text, { status: 429, headers });
-    }
-    const headers = new Headers({ "content-type": response.headers.get("content-type") || "application/json" });
-    headers.set("retry-after", "2");
+    log({
+      event: "upstream_429", ...meta, attempt,
+      exhausted: /free usage limit/i.test(text),
+      body: text.slice(0, 400),
+    });
+    const headers = new Headers({
+      "content-type": response.headers.get("content-type") || "application/json",
+    });
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter) headers.set("retry-after", retryAfter);
     headers.set("x-oc-native", "1");
-    headers.set("x-oc-reset", "shape");
+    headers.set("x-oc-reset", "manual");
     return new Response(text, { status: 429, headers });
   }
 }
@@ -661,8 +598,9 @@ const server = Bun.serve({
     if (request.method === "GET" && url.pathname === "/health") {
       return json({
         ok: Boolean(identity), port: server.port, inflight,
-        pacing: { minStartGapMs: MIN_START_GAP_MS, headerTimeoutMs: HEADER_TIMEOUT, maxRecovery: MAX_RECOVERY_ATTEMPTS },
-        recovery: { running: Boolean(recovery), last: lastRecovery, lastAttemptAt, probe: probeCache },
+        pacing: { minStartGapMs: MIN_START_GAP_MS, headerTimeoutMs: HEADER_TIMEOUT },
+        tools: { canonicalOnly: !CLIENT_TOOL_EXTRAS },
+        quota: { automaticRecovery: false },
         identity: identity
           ? { version: identity.version, capturedAt: identity.capturedAt,
               systemLen: identity.system.length, tools: identity.tools.length }
@@ -703,7 +641,6 @@ const server = Bun.serve({
     try {
       return await upstream(body, request, {
         model, started, bytes: body.length, wantsStream: normalized.wantsStream, shape: normalized.shape,
-        canonicalCount: normalized.canonicalCount,
       });
     } catch (error) {
       if (request.signal.aborted) return new Response(null, { status: 499 });

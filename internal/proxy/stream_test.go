@@ -167,8 +167,14 @@ func TestStreamConversionRejectsUndeclaredToolCalls(t *testing.T) {
 	}
 
 	got := out.String()
-	if strings.Contains(got, "tool_use") || strings.Contains(got, "undeclared_tool") {
-		t.Fatalf("undeclared tool leaked into Anthropic stream:\n%s", got)
+	// The call itself must never leak as a tool_use block, but the drop must
+	// now be visible: a silent end_turn is what made Claude Code inject a
+	// synthetic "no visible output" continuation and stall the agent loop.
+	if strings.Contains(got, `"type":"tool_use"`) {
+		t.Fatalf("undeclared tool leaked into Anthropic stream as a tool_use:\n%s", got)
+	}
+	if !strings.Contains(got, "[opencode-cc] Dropped tool call(s) undeclared_tool") {
+		t.Fatalf("dropped call was not surfaced to the client:\n%s", got)
 	}
 	if !strings.Contains(got, `"stop_reason":"end_turn"`) {
 		t.Fatalf("stop reason was not normalized:\n%s", got)

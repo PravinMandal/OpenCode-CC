@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -18,6 +19,35 @@ func TestReadyPort(t *testing.T) {
 	for line, want := range cases {
 		if got := readyPort(line); got != want {
 			t.Errorf("readyPort(%q) = %d, want %d", line, got, want)
+		}
+	}
+}
+
+// The free tier's quota is per public IP/64, and rotation is an operator-only
+// decision. The transport must never probe, retry, or spawn the reset engine
+// on a 429, and must default to the canonical tool prefix: extra client tools
+// make the request look like an unknown client and turn every turn into a
+// shape 429 followed by a retry.
+func TestTransportHasNoAutomaticQuotaRecovery(t *testing.T) {
+	raw, err := assets.ReadFile("transport.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	for _, forbidden := range []string{
+		"recoverQuota(", "stockProbe(", "canonicalOnlyBody(", "request-reset.mjs",
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Errorf("transport must not contain %q: automatic quota recovery/retry is forbidden", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"tools_suppressed",
+		"BRIDGE_CLIENT_TOOL_EXTRAS",
+		`headers.set("x-oc-reset", "manual")`,
+	} {
+		if !strings.Contains(src, required) {
+			t.Errorf("transport is missing %q", required)
 		}
 	}
 }
