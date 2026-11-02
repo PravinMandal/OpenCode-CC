@@ -138,16 +138,17 @@
   `ds-flash.conf` drop-in; `OPENCODE_CC_DS_FLASH_FETCH_URL` is no longer read.
 - The Bun hop is not optional: the same request returns 200 from Bun and 429
   from Go, Node, Python or curl. Do not "simplify" it into the Go transport.
-- The free tier accepts the stock 13 OpenCode tools plus at most 6 client tools
-  (19 total). The sidecar trims extras and retries canonical-only once on a
-  shape 429; quota rotation only happens when a stock probe also fails.
+- The free tier accepts the captured 13 OpenCode tools. Appending client tools
+  makes the request look like an unknown client: 19 tools 429ed while the same
+  turn at 13 returned 200 (2026-11-02). The sidecar sends canonical-only and
+  translates each call back to the client's tool name and arguments. A 429 is
+  returned as-is: never probe, retry, or rotate the network automatically.
 - OpenCode CLI and T3 OpenCode stay direct to opencode.ai. CPA fronts Claude,
   Codex, Antigravity and LFM3 only. CPA has exactly one `opencode-cc` Claude
   provider, and both free aliases (`oc/...`) live on it.
-- `~/.local/bin/claude-t3` is the T3 Claude launcher. It rewrites
-  `--tools default` to a lean set and adds `--strict-mcp-config` for free
-  models; local models get a four-tool set, a short prompt, low effort and a
-  16k context hint. It never routes traffic.
+- `~/.local/bin/claude-t3` is the T3 Claude launcher. It shapes `local/*` only
+  (four tools, a short prompt, low effort, 16k context hint); free and paid
+  models are `exec`'d untouched. It never routes traffic.
 
 Historical notes from the retired helper, kept for evidence — not instructions:
 

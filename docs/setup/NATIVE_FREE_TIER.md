@@ -55,24 +55,28 @@ without an `opencode-cc` release.
 
 ## Tool-surface gate
 
-Zen also gates the free lane on the tool set. Measured on 2026-11-01:
+Zen also gates the free lane on the tool set. Measured on 2026-11-02:
 
 - the stock OpenCode 13 tools are the canonical prefix and are accepted;
-- 19 total tools pass;
-- 20 total tools fail with `FreeUsageLimitError`, even when the same `/64`
-  passes a stock probe;
-- some 17/18-tool subsets fail, so it is not only a count.
+- 19 total tools (13 canonical + 6 client tools) fail with
+  `FreeUsageLimitError`, and the same turn at 13 tools returns 200;
+- 20 total tools also fail. This is not a simple count: an unfamiliar tool name
+  makes the request look like an unknown client.
 
 The sidecar therefore:
 
-1. prepends the captured canonical system prompt and the canonical 13 tools;
-2. appends at most 6 client tools (`BRIDGE_MAX_TOOLS`, default 19 total),
-   preserving client order and dropping the rest;
-3. logs `tools_trimmed` with counts and an 8-name deduped sample;
-4. if the request still gets a shape `429`, retries once with the canonical 13
-   tools only (`shape_retry`);
-5. only rotates the network when a stock-shaped probe also fails. A shape
-   rejection is never "fixed" by cycling the hotspot.
+1. replaces the client's tool list with the captured canonical 13 tools;
+2. suppresses client-only tools and logs `tools_suppressed` once per distinct
+   tool-name set;
+3. keeps the client's tools executable by translating the canonical call back
+   to the declared tool name and argument keys (`shell`→`Bash`, `read`→`Read`,
+   `skill`→`Skill`, `path`→`file_path`, …);
+4. falls back to `Bash` + `rg` when the client does not declare `Grep`/`Glob`;
+5. emits a visible text notice when a call cannot be resolved, instead of
+   ending the turn silently.
+
+`BRIDGE_CLIENT_TOOL_EXTRAS=1` appends client tools for deliberate experiments,
+but that shape is known to be rejected by the free tier and is not the default.
 
 The captured system prompt embeds the capture date, so the sidecar substitutes
 today's date at request time; otherwise an identity captured yesterday would be
@@ -117,32 +121,28 @@ All knobs are optional environment variables read by the sidecar:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BRIDGE_MAX_TOOLS` | `19` | total tool cap (canonical + client extras) |
+| `BRIDGE_CLIENT_TOOL_EXTRAS` | unset | `1` = append client tools (not recommended; the free tier rejects the shape) |
+| `BRIDGE_MAX_TOOLS` | `19` | total tool cap only when extras are enabled |
+| `BRIDGE_CLIENT_TOOL_PRIORITY` | `ToolSearch,DeferredToolPlaceholder,ReportFindings,ScheduleWakeup,Workflow,ListAgents` | extras preference order |
 | `BRIDGE_MAX_TOOL_CHARS` | `38000` | hard character cap for the tool surface |
-| `BRIDGE_MAX_RECOVERY` | `2` | maximum egress rotations per request |
-| `BRIDGE_RECOVERY_INTERVAL_MS` | `60000` | minimum gap between rotations |
 | `BRIDGE_MIN_START_GAP_MS` | `400` | spacing between request starts |
 | `BRIDGE_HEADER_TIMEOUT_MS` | `240000` | upstream header deadline |
 | `BRIDGE_MAX_INFLIGHT` | `8` | concurrent requests |
 | `BRIDGE_TRACE_DIR` | unset | dump normalized request bodies for diagnosis |
-| `BRIDGE_RESET_ENGINE` | `~/.config/opencode/scripts/request-reset.mjs` | optional egress reset command |
 | `OPENCODE_CC_BUN` | autodetect | Bun executable |
 
-### Quota reset is optional
+### Quota handling
 
-When a 429 is followed by a failing stock probe, the sidecar runs the configured
-reset engine once with `--source=opencode-cc`. On this machine that engine
-notifies the phone and verifies the public IPv6 prefix changed; it is
-user-specific and is not shipped in this repository. If the script is absent,
-the sidecar logs `recovery_unavailable` and returns the upstream 429 — paid
-models are unaffected.
+A 429 is returned to the caller as-is. The sidecar does **not** probe the
+budget, retry with a different shape, or rotate the egress. Automatic rotation
+is forbidden by policy: an operator may run a reset by hand, but the proxy and
+its watcher must never do it on their own.
 
 The sidecar adds diagnostic headers to a 429:
 
 - `x-oc-native: 1`
-- `x-oc-reset: needed` (budget wall) or `shape` (request-shape rejection)
-- `x-oc-reset-last: <timestamp>` when a rotation has run
-- `x-oc-reset-throttled: 1` when the minimum interval blocked another rotation
+- `x-oc-reset: manual`
+- `retry-after` passed through from the provider when present
 
 ## Migration from the fixed-port helper
 
