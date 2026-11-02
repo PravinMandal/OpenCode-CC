@@ -33,7 +33,17 @@ fi
 # Free models measured ~28 KB / 18 tools after the adapter's canonical prefix,
 # comfortably under the free-tier count and character limits. Keep Bash and the
 # file tools: a free model that cannot read or edit is not useful for coding.
-LEAN_FREE="Agent,AskUserQuestion,Bash,Edit,Read,ToolSearch,Write"
+#
+# `Skill` and `Grep`/`Glob` matter more than they look: without `Skill` a model
+# reads the skill list in its system prompt, announces "I'll load the skill",
+# has no tool to call, and returns a text-only end_turn — the turn then looks
+# like it "stopped by itself". Without Grep/Glob free models burn the whole turn
+# shelling out to `grep` by hand.
+#
+# Names that are not real tools in this CLI build are dropped silently by
+# `--tools`, so only use names that actually appear in the request. Measured
+# surface for this list: 11 tools / ~21 KB, accepted by the free tier.
+LEAN_FREE="Agent,Bash,Edit,Glob,Grep,Read,Skill,WebFetch,WebSearch,Write"
 LEAN_LOCAL="${CLAUDE_T3_LOCAL_TOOLS:-Bash,Read,Write,Edit}"
 LOCAL_CONTEXT="${CLAUDE_T3_LOCAL_CONTEXT:-16384}"
 LOCAL_PROMPT="${CLAUDE_T3_LOCAL_PROMPT:-You are a concise coding agent running locally on this machine. Use the available tools to inspect, edit, and run code. Keep replies short and do not dump large files because the context window is small.}"
