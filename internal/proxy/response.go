@@ -170,7 +170,14 @@ func finishReasonToStop(reason *string) *string {
 }
 
 func finishReasonToStopForMessage(reason *string, hasToolUse bool) *string {
-	if hasToolUse && (reason == nil || *reason == "stop") {
+	if reason != nil && *reason == "length" {
+		s := "max_tokens"
+		return &s
+	}
+	// Any emitted tool_use block must be advertised as tool_use; clients key
+	// execution off stop_reason. Unknown/content_filter finishes used to fall
+	// through to end_turn and strand an executable call.
+	if hasToolUse {
 		s := "tool_use"
 		return &s
 	}
@@ -185,8 +192,7 @@ func finishReasonToStopForMessage(reason *string, hasToolUse bool) *string {
 	case "length":
 		mapped = "max_tokens"
 	case "tool_calls", "function_call":
-		mapped = "tool_use"
-	case "content_filter":
+		// Upstream promised a call but none survived conversion.
 		mapped = "end_turn"
 	default:
 		mapped = "end_turn"

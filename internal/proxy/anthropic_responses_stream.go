@@ -8,6 +8,7 @@ package proxy
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -470,6 +471,29 @@ func (c *ResponsesToAnthropicStreamer) flushTool(itemID string) error {
 		// nothing was lost, stay silent.
 		return nil
 	}
+	args := strings.TrimSpace(p.args.String())
+	if args == "" {
+		args = "{}"
+	}
+	// input_json_delta fragments must concatenate to valid JSON. The terminal
+	// incomplete status may arrive after output_item.done, so defer an
+	// invalid payload until finalizeWith has seen the status; a truncated
+	// call is then dropped (surfacing max_tokens) instead of being emitted as
+	// executable tool_use. Corrupt non-truncated args fall back to {}.
+	if !json.Valid([]byte(args)) {
+		if !c.finalized {
+			p.emitted = false
+			return nil
+		}
+		if c.incomplete {
+			drop := p.describeDrop()
+			drop.Reason = "truncated-args"
+			drop.Declared = cappedDeclaredNames(c.allowedNames)
+			c.droppedCalls = append(c.droppedCalls, drop)
+			return nil
+		}
+		args = "{}"
+	}
 	emitName := p.name
 	if emitName == "" {
 		// The name never arrived on the wire (Zen streams bare
@@ -514,10 +538,6 @@ func (c *ResponsesToAnthropicStreamer) flushTool(itemID string) error {
 	callID := p.callID
 	if callID == "" {
 		callID = "call_" + randHex(24)
-	}
-	args := strings.TrimSpace(p.args.String())
-	if args == "" {
-		args = "{}"
 	}
 	idx := c.nextIndex
 	c.nextIndex++
