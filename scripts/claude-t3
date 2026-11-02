@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
 # claude-t3: Claude Code launcher for T3 Code.
 #
-# T3 asks the Claude Agent SDK for the `claude_code` tool preset, which makes
-# the CLI send ~85 tools (~73 KB). The Zen free tier accepts the stock 13
-# OpenCode tools plus only a few client tools (19 total measured), so a free
-# model rejects that surface before the turn starts, and T3's `launchArgs`
-# cannot fix it: the SDK emits `--tools default` before any extra arguments,
-# and a second `--tools` does not replace it.
+# One job: make the local model (local/*) fit inside its small window.
 #
-# This launcher only rewrites client-side arguments. It never handles traffic:
-# the CLI still talks to CPA exactly as before, and paid models get their
-# arguments untouched.
+# LFM3 runs on CPU with a 16k window, so it gets a four-tool surface, a short
+# system prompt, low effort and a 16k context hint.
 #
-# Two model families are trimmed:
-#   * free models (`oc/*`, `*-free`, `big-pickle`) get a lean coding tool set;
-#   * local models (`local/*`) get the smallest useful set, a short system
-#     prompt, low effort and a 16k context hint, because LFM3 runs on CPU with
-#     a 16k window.
+# Everything else -- paid (cx/*, ag/*) and free (oc/*) -- is exec'd untouched.
+# Free models do not need help here: the opencode-cc sidecar already trims every
+# free request to the 13 canonical OpenCode tools plus at most 6 client tools,
+# which is the free tier's measured limit. Measured on this machine on
+# 2026-11-02: the stock CLI surface is trimmed to 19 tools and the turn
+# succeeds, so shaping it here as well only changed which tools got dropped.
 #
-# Nothing is pinned to today's model names.
+# This launcher only rewrites client-side arguments. It never handles traffic.
 set -euo pipefail
 
 REAL="${CLAUDE_T3_REAL:-$HOME/.local/share/mise/installs/claude/latest/claude}"
@@ -30,37 +25,9 @@ if [ -z "$REAL" ] || [ ! -x "$REAL" ]; then
   exit 127
 fi
 
-# Free models measured ~28 KB / 18 tools after the adapter's canonical prefix,
-# comfortably under the free-tier count and character limits. Keep Bash and the
-# file tools: a free model that cannot read or edit is not useful for coding.
-#
-# `Skill` and `Grep`/`Glob` matter more than they look: without `Skill` a model
-# reads the skill list in its system prompt, announces "I'll load the skill",
-# has no tool to call, and returns a text-only end_turn — the turn then looks
-# like it "stopped by itself". Without Grep/Glob free models burn the whole turn
-# shelling out to `grep` by hand.
-#
-# Names that are not real tools in this CLI build are dropped silently by
-# `--tools`, so only use names that actually appear in the request. Measured
-# surface for this list: 11 tools / ~21 KB, accepted by the free tier.
-LEAN_FREE="Agent,Bash,Edit,Glob,Grep,Read,Skill,WebFetch,WebSearch,Write"
 LEAN_LOCAL="${CLAUDE_T3_LOCAL_TOOLS:-Bash,Read,Write,Edit}"
 LOCAL_CONTEXT="${CLAUDE_T3_LOCAL_CONTEXT:-16384}"
 LOCAL_PROMPT="${CLAUDE_T3_LOCAL_PROMPT:-You are a concise coding agent running locally on this machine. Use the available tools to inspect, edit, and run code. Keep replies short and do not dump large files because the context window is small.}"
-
-is_free() {
-  case "${1:-}" in
-    oc/*|*-free|big-pickle|*/big-pickle) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-is_local() {
-  case "${1:-}" in
-    local/*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
 model=""
 args=("$@")
@@ -74,54 +41,36 @@ while [ "$i" -lt "${#args[@]}" ]; do
 done
 [ -n "$model" ] || model="${ANTHROPIC_MODEL:-}"
 
-if is_free "$model"; then
-  mode=free
-  lean="$LEAN_FREE"
-elif is_local "$model"; then
-  mode=local
-  lean="$LEAN_LOCAL"
-else
-  exec "$REAL" "$@"
-fi
+case "$model" in
+  local/*) ;;
+  *) exec "$REAL" "$@" ;;
+esac
 
 out=()
 seen_tools=0
-seen_strict=0
 seen_effort=0
 seen_system=0
 i=0
 while [ "$i" -lt "${#args[@]}" ]; do
   case "${args[$i]}" in
     --tools)
-      out+=(--tools "$lean")
+      out+=(--tools "$LEAN_LOCAL")
       i=$((i + 2))
       seen_tools=1
       ;;
     --tools=*)
-      out+=(--tools "$lean")
+      out+=(--tools "$LEAN_LOCAL")
       i=$((i + 1))
       seen_tools=1
       ;;
-    --strict-mcp-config)
-      out+=("${args[$i]}")
-      i=$((i + 1))
-      seen_strict=1
-      ;;
     --effort)
-      if [ "$mode" = local ]; then
-        out+=(--effort low)
-      else
-        out+=("${args[$i]}" "${args[$((i + 1))]:-}")
-      fi
+      # LFM3 only advertises a low effort level, and T3's default is high.
+      out+=(--effort low)
       i=$((i + 2))
       seen_effort=1
       ;;
     --effort=*)
-      if [ "$mode" = local ]; then
-        out+=(--effort low)
-      else
-        out+=("${args[$i]}")
-      fi
+      out+=(--effort low)
       i=$((i + 1))
       seen_effort=1
       ;;
@@ -136,22 +85,17 @@ while [ "$i" -lt "${#args[@]}" ]; do
       ;;
   esac
 done
-[ "$seen_tools" -eq 1 ] || out+=(--tools "$lean")
-[ "$seen_strict" -eq 1 ] || out+=(--strict-mcp-config)
+[ "$seen_tools" -eq 1 ] || out+=(--tools "$LEAN_LOCAL")
+[ "$seen_effort" -eq 1 ] || out+=(--effort low)
+# T3 does not pass a command-line system prompt; replacing the large default
+# preset is what keeps a 16k local model inside its window.
+[ "$seen_system" -eq 1 ] || out+=(--system-prompt "$LOCAL_PROMPT")
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$LOCAL_CONTEXT"
 
-if [ "$mode" = local ]; then
-  # LFM3 only advertises a low effort level, and T3's session default is high.
-  [ "$seen_effort" -eq 1 ] || out+=(--effort low)
-  # T3 does not pass a command-line system prompt; replacing the large default
-  # preset is what keeps a 16k local model inside its window.
-  [ "$seen_system" -eq 1 ] || out+=(--system-prompt "$LOCAL_PROMPT")
-  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$LOCAL_CONTEXT"
-fi
-
-# One line per trimmed launch, so a future tool-surface regression is visible
-# without turning on Claude Code debug logs.
+# One line per shaped launch, so a future regression is visible without
+# turning on Claude Code debug logs.
 LOG="${XDG_STATE_HOME:-$HOME/.local/state}/claude-t3/launch.log"
 mkdir -p "$(dirname "$LOG")"
-printf '%s model=%s mode=%s tools=%s\n' "$(date -Is)" "$model" "$mode" "$lean" >>"$LOG"
+printf '%s model=%s mode=local tools=%s\n' "$(date -Is)" "$model" "$LEAN_LOCAL" >>"$LOG"
 
 exec "$REAL" "${out[@]}"
