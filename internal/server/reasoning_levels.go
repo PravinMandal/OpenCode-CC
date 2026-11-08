@@ -45,6 +45,10 @@ type EffortLevelsCache struct {
 	mu     sync.RWMutex
 	path   string // "" = memory only (tests)
 	levels map[string][]string
+	// persistMu serializes snapshot+write. Without it two Learn/DemoteTop
+	// calls could marshal different states and the older snapshot could
+	// overwrite the newer one after the lock was released.
+	persistMu sync.Mutex
 }
 
 // LoadEffortLevelsCache opens the taught-levels store, loading any
@@ -147,13 +151,43 @@ func (c *EffortLevelsCache) persist() {
 	if c == nil || c.path == "" {
 		return
 	}
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
 	c.mu.RLock()
 	raw, err := json.MarshalIndent(c.levels, "", "  ")
 	c.mu.RUnlock()
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(c.path, raw, 0o644); err != nil {
+	// Write-then-rename: a crash or concurrent reader never sees a
+	// half-written file, and a failed write leaves the previous good cache
+	// in place instead of truncating it.
+	tmp, err := os.CreateTemp(filepath.Dir(c.path), ".reasoning-levels-*.tmp")
+	if err != nil {
+		log.Printf("opencode-cc: cannot persist %s: %v", c.path, err)
+		return
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		log.Printf("opencode-cc: cannot persist %s: %v", c.path, err)
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		log.Printf("opencode-cc: cannot persist %s: %v", c.path, err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		log.Printf("opencode-cc: cannot persist %s: %v", c.path, err)
+		return
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		log.Printf("opencode-cc: cannot persist %s: %v", c.path, err)
+		return
+	}
+	if err := os.Rename(tmpName, c.path); err != nil {
 		log.Printf("opencode-cc: cannot persist %s: %v", c.path, err)
 	}
 }
@@ -228,11 +262,19 @@ func (s *Server) effortForRequest(path, targetModel string, reqBody []byte) stri
 			return ""
 		}
 		if !proxy.IsResponsesNativeModel(targetModel) {
-			// Mirror applyOutputConfigEffort: a thinking-mapping model takes
-			// its effort through that channel instead.
+			// Mirror the chat builder: an explicit budget on an enabled thinking
+			// mapping pins reasoning_effort; a reasoning_effort mapping takes
+			// output_config.effort; a thinking/thinking_budget mapping takes its
+			// own channel, so the row shows no chat-level effort.
 			if s != nil && s.cfg != nil {
-				if _, mapped := s.cfg.Snapshot().ResolveThinkingBudgetMapping(targetModel); mapped {
-					return ""
+				if mapping, mapped := s.cfg.Snapshot().ResolveThinkingBudgetMapping(targetModel); mapped {
+					if strings.ToLower(mapping.Field) != "reasoning_effort" {
+						return ""
+					}
+					if probe.Thinking != nil && strings.EqualFold(probe.Thinking.Type, "enabled") &&
+						probe.Thinking.BudgetTokens > 0 {
+						return thinkingLevel(probe.Thinking.BudgetTokens)
+					}
 				}
 			}
 			return outputConfigEffortFor(&proxy.AnthropicRequest{

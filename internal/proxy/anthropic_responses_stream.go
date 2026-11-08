@@ -516,10 +516,11 @@ func (c *ResponsesToAnthropicStreamer) flushTool(itemID string) error {
 			if resolved != p.name {
 				c.renamedToolCalls++
 			}
-			args = TranslateToolArguments(p.name, resolved, args)
+			args = TranslateToolArgumentsForSchema(p.name, resolved, args, c.declaredSchemas[resolved])
 			emitName = resolved
-		} else if fbName, fbArgs, fbOK := SearchFallback(p.name, args, c.allowedNames); fbOK {
-			// Grep/Glob not declared: keep search working through Bash.
+		} else if fbName, fbArgs, fbOK := ResolveDeclaredCallWithSchemas(p.name, args, c.allowedNames, c.declaredSchemas); fbOK {
+			// Search/file tools the client did not declare: keep the
+			// capability through its shell instead of dropping the call.
 			emitName, args = fbName, fbArgs
 			c.renamedToolCalls++
 		} else {
@@ -544,6 +545,11 @@ func (c *ResponsesToAnthropicStreamer) flushTool(itemID string) error {
 	callID := p.callID
 	if callID == "" {
 		callID = "call_" + randHex(24)
+	}
+	// Remember the canonical call before the client-facing rewrite so the
+	// next request's replayed history can be restored to it.
+	if p.name != "" && (emitName != p.name || args != strings.TrimSpace(p.args.String())) {
+		RememberTranslatedCall(callID, p.name, strings.TrimSpace(p.args.String()), emitName, args)
 	}
 	idx := c.nextIndex
 	c.nextIndex++

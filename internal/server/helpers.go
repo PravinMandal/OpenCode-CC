@@ -96,6 +96,15 @@ func doUpstreamWithRetry(client *http.Client, template *http.Request, body []byt
 			}
 			return resp, nil
 		}
+		// The native sidecar already applied its own bounded retry and deadline
+		// before emitting a 5xx. Re-issuing it here doubled the user-facing stall
+		// and held a second inflight slot for the same terminal failure.
+		if err == nil && resp.StatusCode >= 500 && resp.Header.Get("x-oc-native") != "" {
+			lastStatus = resp.StatusCode
+			lastDetail = "upstream HTTP " + resp.Status + " (native, not retried)"
+			resp.Body.Close()
+			break
+		}
 		if err != nil {
 			lastErr = err
 			lastStatus = 0

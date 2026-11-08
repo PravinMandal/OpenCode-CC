@@ -101,11 +101,13 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		}
 		upstreamStream := in.Stream
 		if proxy.IsFreeModel(targetModel) {
-			upBody, err = proxy.PrepareFreeChatBody(upBody)
-			if err != nil {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
-					"could not prepare Zen free-tier request: "+err.Error())
-				return
+			if !s.nativeTransportReady() {
+				upBody, err = proxy.PrepareFreeChatBody(upBody)
+				if err != nil {
+					writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+						"could not prepare Zen free-tier request: "+err.Error())
+					return
+				}
 			}
 			upstreamStream = true
 		}
@@ -281,6 +283,7 @@ func (s *Server) relayResponsesAnthropicJSON(
 		return
 	}
 	out := proxy.ConvertAnthropicResponseToResponses(&anthResp, incomingModel)
+	filterUndeclaredResponsesTools(out, reqBody)
 	writeJSON(w, http.StatusOK, out)
 
 	stopReason := ""
@@ -332,30 +335,71 @@ func (s *Server) relayResponsesChatAggregated(
 		string(reqBody), mustJSON(out), time.Since(start))
 }
 
+// responsesToolNamesFromBody returns the function tool names a Responses API
+// client declared. Hosted tools (web_search, image_generation, ...) have no
+// name and cannot be executed by the Zen upstream, so they are skipped.
+func responsesToolNamesFromBody(reqBody []byte) []string {
+	request, err := proxy.ParseResponsesRequest(reqBody)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(request.Tools))
+	for _, tool := range request.Tools {
+		if tool.Name != "" {
+			names = append(names, tool.Name)
+		}
+	}
+	return names
+}
+
+// responsesToolSchemasFromBody returns each declared function's input schema,
+// so canonical-schema clients are not argument-translated.
+func responsesToolSchemasFromBody(reqBody []byte) map[string]json.RawMessage {
+	request, err := proxy.ParseResponsesRequest(reqBody)
+	if err != nil {
+		return nil
+	}
+	schemas := make(map[string]json.RawMessage, len(request.Tools))
+	for _, tool := range request.Tools {
+		if tool.Name != "" && len(tool.Parameters) > 0 {
+			schemas[tool.Name] = tool.Parameters
+		}
+	}
+	if len(schemas) == 0 {
+		return nil
+	}
+	return schemas
+}
+
+// filterUndeclaredResponsesTools resolves upstream function calls to the tool
+// names the client actually declared, translating argument keys and falling
+// back to a declared shell when the structured tool is absent. Calls the
+// client cannot express are dropped rather than handed back as unknown names.
 func filterUndeclaredResponsesTools(out *proxy.ResponsesResponse, reqBody []byte) {
 	if out == nil {
 		return
 	}
-	var request struct {
-		Tools []struct {
-			Name string `json:"name"`
-		} `json:"tools"`
-	}
-	if json.Unmarshal(reqBody, &request) != nil {
-		return
-	}
-	declared := make(map[string]struct{}, len(request.Tools))
-	for _, tool := range request.Tools {
-		if tool.Name != "" {
-			declared[tool.Name] = struct{}{}
-		}
-	}
+	declared := responsesToolNamesFromBody(reqBody)
+	schemas := responsesToolSchemasFromBody(reqBody)
 	filtered := out.Output[:0]
 	for _, item := range out.Output {
 		if item.Type == "function_call" {
-			if _, ok := declared[item.Name]; !ok {
+			if len(declared) == 0 {
+				// The client declared no tools, so it cannot execute any
+				// function call. Returning one anyway surfaces a phantom
+				// call the client rejects (or silently ignores).
 				continue
 			}
+			originalArgs := item.Arguments
+			name, args, ok := proxy.ResolveDeclaredCallWithSchemas(item.Name, item.Arguments, declared, schemas)
+			if !ok {
+				continue
+			}
+			if name != item.Name || args != originalArgs {
+				proxy.RememberTranslatedCall(item.CallID, item.Name, originalArgs, name, args)
+			}
+			item.Name = name
+			item.Arguments = args
 		}
 		filtered = append(filtered, item)
 	}
@@ -408,6 +452,7 @@ func (s *Server) relayResponsesJSON(
 		return
 	}
 	out := proxy.ConvertResponsesResponse(chatResp, incomingModel)
+	filterUndeclaredResponsesTools(out, reqBody)
 	writeJSON(w, http.StatusOK, out)
 
 	stopReason := ""
@@ -460,6 +505,7 @@ func (s *Server) relayResponsesStream(
 			http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
 		return
 	}
+	converter.RestrictToolsWithSchemas(responsesToolNamesFromBody(reqBody), responsesToolSchemasFromBody(reqBody))
 	flusher.Flush()
 
 	scanResult, scanErr := proxy.ScanOpenAIStreamWithStatus(reader, func(chunk *proxy.OpenAIStreamChunk) error {
@@ -537,6 +583,7 @@ func (s *Server) relayResponsesAnthropicStream(
 			http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
 		return
 	}
+	converter.RestrictToolsWithSchemas(responsesToolNamesFromBody(reqBody), responsesToolSchemasFromBody(reqBody))
 	flusher.Flush()
 
 	var inputTokens, outputTokens int

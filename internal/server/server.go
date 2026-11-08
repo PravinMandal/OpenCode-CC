@@ -31,8 +31,19 @@ type Server struct {
 	done chan struct{}
 	// keepAliveOnce guards against starting the pinger twice.
 	keepAliveOnce sync.Once
+	// maintenanceOnce guards against starting the retention loop twice.
+	maintenanceOnce sync.Once
 	// stopOnce guards closing done exactly once.
 	stopOnce sync.Once
+	// mu guards srv against the Start/Shutdown race: a signal can arrive
+	// while Start is still bringing the sidecar up.
+	mu sync.Mutex
+	// nativeHealth caches the sidecar's /health verdict: "port open" is not
+	// the same as "identity captured", and routing a free request to a
+	// sidecar that answers 503 has no fallback.
+	nativeHealthMu sync.Mutex
+	nativeHealthAt time.Time
+	nativeHealthOK bool
 }
 
 // New constructs a Server. The store may be nil if request logging is disabled.
@@ -154,6 +165,17 @@ func (s *Server) panelPlaceholder(w http.ResponseWriter, r *http.Request) {
 
 // Start begins serving. It blocks until Shutdown is called.
 func (s *Server) Start(handler http.Handler) error {
+	srv := &http.Server{
+		Addr:              s.cfg.Snapshot().ListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		// WriteTimeout left at 0 so long streams are not killed.
+	}
+	// Publish the server before any slow startup step so Shutdown can drain
+	// (or refuse to serve) even if a signal arrives during sidecar start.
+	s.mu.Lock()
+	s.srv = srv
+	s.mu.Unlock()
 	if s.native != nil {
 		// Bounded: a sidecar that is slow or broken must not keep the paid
 		// routes offline. Free requests get a clear 503 until it is ready.
@@ -161,16 +183,12 @@ func (s *Server) Start(handler http.Handler) error {
 		s.native.Start(ctx)
 		cancel()
 	}
-	s.srv = &http.Server{
-		Addr:              s.cfg.Snapshot().ListenAddr,
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		// WriteTimeout left at 0 so long streams are not killed.
-	}
 	// Hold upstream sockets warm so the first turn after an idle gap skips the
 	// ~610ms cold-connection handshake.
 	s.StartKeepAlive()
-	return s.srv.ListenAndServe()
+	// Bound the request log so SQLite does not grow without limit.
+	s.StartMaintenance()
+	return srv.ListenAndServe()
 }
 
 // Shutdown gracefully stops the server.
@@ -182,13 +200,32 @@ func (s *Server) Shutdown() error {
 			close(s.done)
 		}
 	})
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	var err error
+	if srv != nil {
+		// A nil context would panic on ctx.Done() as soon as one connection is
+		// still open; give the drain a bounded budget instead.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err = srv.Shutdown(ctx)
+		cancel()
+		if err != nil {
+			// Shutdown does not close connections whose handlers outlive the
+			// deadline. Free-tier agent turns routinely run longer than 15s,
+			// so without Close the sidecar would be stopped while a handler
+			// is still writing to it — the 502 burst this ordering exists to
+			// prevent.
+			_ = srv.Close()
+		}
+	}
+	// Drain in-flight HTTP requests BEFORE stopping the sidecar: a free-tier
+	// request still on the wire needs the Bun process to finish. Stopping it
+	// first turned every restart into a burst of 502s.
 	if s.native != nil {
 		s.native.Stop()
 	}
-	if s.srv == nil {
-		return nil
-	}
-	return s.srv.Shutdown(nil)
+	return err
 }
 
 // mountPanelAPI wires the panel's REST API onto mux via the api package.

@@ -84,18 +84,18 @@ func TestClampCooldownBounds(t *testing.T) {
 	if got := clampCooldown(48 * time.Hour); got != maxCooldownCeiling {
 		t.Fatalf("48h should clamp to ceiling, got %v", got)
 	}
-	if got := clampCooldown(5 * time.Minute); got != 5*time.Minute {
-		t.Fatalf("5m should pass through, got %v", got)
+	if got := clampCooldown(5 * time.Minute); got != maxCooldownCeiling {
+		t.Fatalf("5m should clamp to ceiling, got %v", got)
 	}
 }
 
-// The 14.6h value Zen actually sends must survive the round trip; clamping
-// exists to defend against absurd values, not to truncate the real signal.
-func TestClampCooldownPreservesZenDailyWindow(t *testing.T) {
+// A long Zen window must be shortened to the retry budget so the quota plugin
+// can recover the lane after an IP rotation.
+func TestClampCooldownCapsZenDailyWindow(t *testing.T) {
 	const zenRetryAfter = 52638
 	d := clampCooldown(time.Duration(zenRetryAfter) * time.Second)
-	if int(d.Seconds()) != zenRetryAfter {
-		t.Fatalf("Zen daily window mangled: got %ds want %ds", int(d.Seconds()), zenRetryAfter)
+	if d != maxCooldownCeiling {
+		t.Fatalf("Zen daily window not capped: got %v want %v", d, maxCooldownCeiling)
 	}
 }
 
@@ -189,8 +189,8 @@ func TestStampCooldownUsesUpstreamRetryAfter(t *testing.T) {
 
 	s.stampCooldown(rec, up, "space-bunny-free")
 
-	if got := rec.Header().Get("Retry-After"); got != "600" {
-		t.Fatalf("Retry-After = %q, want 600 (upstream value)", got)
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Fatalf("Retry-After = %q, want 60 (capped upstream value)", got)
 	}
 }
 
@@ -230,8 +230,8 @@ func TestPassUpstreamError429CarriesRetryAfter(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", rec.Code)
 	}
-	if got := rec.Header().Get("Retry-After"); got != "900" {
-		t.Fatalf("Retry-After = %q, want 900", got)
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Fatalf("Retry-After = %q, want 60", got)
 	}
 }
 

@@ -48,9 +48,10 @@ var cooldownFallbacks = []time.Duration{
 
 const (
 	// maxCooldownCeiling caps any propagated value. A hostile or buggy upstream
-	// must not park a client for days on a single header; 24h matches Zen's own
-	// daily free-tier window, so the real signal still gets through intact.
-	maxCooldownCeiling = 24 * time.Hour
+	// must not park a client for hours on a single header. The relay itself does
+	// not gate requests on this value, and the quota plugin needs a short retry
+	// window so it can recover the lane after an IP rotation.
+	maxCooldownCeiling = 60 * time.Second
 	// maxCooldownFloor keeps a sub-second value from becoming a hot retry loop.
 	maxCooldownFloor = 5 * time.Second
 )

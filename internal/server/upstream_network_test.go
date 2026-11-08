@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Reject actual SOCKS5 CONNECT handshakes with reply 4 (host unreachable),
@@ -113,6 +114,43 @@ func TestPersistentProxyFailureReturnsShortServiceRetry(t *testing.T) {
 	}
 	if hits.Load() != 6 {
 		t.Fatalf("unbounded retry: %d attempts, want 3 per request", hits.Load())
+	}
+}
+
+// The native sidecar applies its own bounded retry and deadline before it
+// emits a 5xx. Retrying that response here doubled the user-facing stall and
+// held a second inflight slot for the same terminal failure. Direct Zen 5xx
+// still retries once (covered by TestProxyHostUnreachable...).
+func TestUpstreamRetrySkipsNativeSidecar5xx(t *testing.T) {
+	var hits atomic.Int64
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("x-oc-native", "1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, `{"error":{"message":"upstream transport failed"}}`)
+	}))
+	defer sidecar.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, sidecar.URL, strings.NewReader(`{}`))
+	started := time.Now()
+	resp, err := doUpstreamWithRetry(sidecar.Client(), req, []byte(`{}`))
+	elapsed := time.Since(started)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("native 502 should surface as an error, not a response")
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("native sidecar 502 attempted %d times, want exactly 1", hits.Load())
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("native sidecar 502 waited %s; the retry sleep should be skipped", elapsed)
+	}
+	var statusErr *upstreamStatusError
+	if !errors.As(err, &statusErr) || statusErr.status != http.StatusBadGateway {
+		t.Fatalf("error = %v, want upstreamStatusError 502", err)
 	}
 }
 

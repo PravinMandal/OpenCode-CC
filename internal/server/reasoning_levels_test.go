@@ -1,10 +1,13 @@
 package server
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -55,6 +58,51 @@ func TestEffortLevelsCacheLearnAndPersist(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "reasoning-levels.json")); err != nil {
 		t.Errorf("cache file: %v", err)
+	}
+}
+
+func TestEffortLevelsCacheConcurrentPersist(t *testing.T) {
+	dir := t.TempDir()
+	c := LoadEffortLevelsCache(dir)
+	const models = 32
+	var wg sync.WaitGroup
+	for i := 0; i < models; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			model := fmt.Sprintf("model-%02d", i)
+			c.Learn(model, []string{"low", "medium", "high"})
+			c.DemoteTop(model)
+		}(i)
+	}
+	wg.Wait()
+
+	// Every concurrent writer must survive: an unserialized write could
+	// truncate the file or let an older snapshot win.
+	raw, err := os.ReadFile(filepath.Join(dir, "reasoning-levels.json"))
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	var disk map[string][]string
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		t.Fatalf("cache is not valid JSON after concurrent writes: %v\n%s", err, raw)
+	}
+	if len(disk) != models {
+		t.Fatalf("cache holds %d models, want %d", len(disk), models)
+	}
+	for i := 0; i < models; i++ {
+		model := fmt.Sprintf("model-%02d", i)
+		if got := disk[model]; !reflect.DeepEqual(got, []string{"low", "medium"}) {
+			t.Fatalf("%s = %v, want demoted [low medium]", model, got)
+		}
+	}
+	// Atomic writes must not leave temp files behind.
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".reasoning-levels-*"))
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temp files left behind: %v", leftovers)
 	}
 }
 

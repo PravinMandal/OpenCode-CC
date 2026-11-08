@@ -54,6 +54,54 @@ func newNativeTransport(base http.RoundTripper, mgr nativeEndpoint) http.RoundTr
 	}
 }
 
+// nativeTransportReady reports whether the Bun sidecar is currently able to
+// serve free-tier requests. When it is ready, the sidecar supplies the
+// canonical tool set itself, so the Go layer must not inject free-tier marker
+// tools: they would be indistinguishable from client declarations and would
+// keep shell/read alive for a client that declared no tools.
+//
+// Readiness means the sidecar answered /health with ok=true, not merely that
+// its port is open: on a first install (or after a corrupt capture) the
+// sidecar announces its port before an identity exists and answers 503 to
+// every completion.
+func (s *Server) nativeTransportReady() bool {
+	if s == nil || s.native == nil || !s.native.Enabled() {
+		return false
+	}
+	endpoint, token, err := s.native.Endpoint()
+	if err != nil {
+		return false
+	}
+	s.nativeHealthMu.Lock()
+	at, cached := s.nativeHealthAt, s.nativeHealthOK
+	s.nativeHealthMu.Unlock()
+	if !at.IsZero() && time.Since(at) < 2*time.Second {
+		return cached
+	}
+	ok := false
+	healthURL := strings.TrimSuffix(endpoint, "/v1/chat/completions") + "/health"
+	if req, reqErr := http.NewRequest(http.MethodGet, healthURL, nil); reqErr == nil {
+		if token != "" {
+			req.Header.Set("x-bridge-token", token)
+		}
+		client := &http.Client{Timeout: 700 * time.Millisecond}
+		if resp, doErr := client.Do(req); doErr == nil {
+			var body struct {
+				OK bool `json:"ok"`
+			}
+			if resp.StatusCode == http.StatusOK &&
+				json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body) == nil {
+				ok = body.OK
+			}
+			_ = resp.Body.Close()
+		}
+	}
+	s.nativeHealthMu.Lock()
+	s.nativeHealthAt, s.nativeHealthOK = time.Now(), ok
+	s.nativeHealthMu.Unlock()
+	return ok
+}
+
 func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if !isZenChatCompletion(r) || r.GetBody == nil {
 		return t.base.RoundTrip(r)

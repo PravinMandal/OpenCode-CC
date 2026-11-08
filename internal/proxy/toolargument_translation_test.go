@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -26,6 +27,8 @@ func TestResolveDeclaredToolNameCanonicalAliases(t *testing.T) {
 		{"write", []string{"Write"}, "Write"},
 		{"read", []string{"Read"}, "Read"},
 		{"shell", []string{"Bash"}, "Bash"},
+		{"shell", []string{"exec_command"}, "exec_command"},
+		{"shell", []string{"exec_command", "write_stdin"}, "exec_command"},
 		// Namespaced shape still resolves.
 		{"default.skill", []string{"Skill"}, "Skill"},
 		// Undeclared capability stays undeclared rather than guessing.
@@ -42,6 +45,83 @@ func TestResolveDeclaredToolNameCanonicalAliases(t *testing.T) {
 		if !ok || got != tc.want {
 			t.Fatalf("%q -> %q (ok=%v), want %q", tc.upstream, got, ok, tc.want)
 		}
+	}
+}
+
+// A client that declares the canonical OpenCode schema (the native OpenCode
+// tool set) already speaks path/oldString/workdir. Renaming those keys would
+// corrupt a call it can execute as-is.
+func TestResolveDeclaredCallWithSchemasCanonicalPassthrough(t *testing.T) {
+	declared := []string{"read", "write", "edit", "shell"}
+	schemas := map[string]json.RawMessage{
+		"read":  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`),
+		"write": json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}}}`),
+		"edit":  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}}}`),
+		"shell": json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"}}}`),
+	}
+	tests := []struct{ name, args string }{
+		{"read", `{"path":"/tmp/f.txt"}`},
+		{"write", `{"path":"/tmp/f.txt","content":"x"}`},
+		{"edit", `{"path":"/tmp/f.txt","oldString":"a","newString":"b","replaceAll":true}`},
+		{"shell", `{"command":"pwd","workdir":"/tmp/x"}`},
+	}
+	for _, tc := range tests {
+		gotName, gotArgs, ok := ResolveDeclaredCallWithSchemas(tc.name, tc.args, declared, schemas)
+		if !ok || gotName != tc.name {
+			t.Fatalf("%s resolved to %q (ok=%v)", tc.name, gotName, ok)
+		}
+		if gotArgs != tc.args {
+			t.Fatalf("%s args were rewritten: %s -> %s", tc.name, tc.args, gotArgs)
+		}
+	}
+}
+
+// The same names with a client schema that uses file_path/old_string must
+// still be translated for DSH-style clients.
+func TestResolveDeclaredCallWithSchemasTranslatesClientShape(t *testing.T) {
+	declared := []string{"read", "edit"}
+	schemas := map[string]json.RawMessage{
+		"read": json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}}}`),
+		"edit": json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}}}`),
+	}
+	name, args, ok := ResolveDeclaredCallWithSchemas("read", `{"path":"/tmp/f.txt"}`, declared, schemas)
+	if !ok || name != "read" {
+		t.Fatalf("read resolved to %q (ok=%v)", name, ok)
+	}
+	if args != `{"file_path":"/tmp/f.txt"}` {
+		t.Fatalf("read args = %s, want file_path translation", args)
+	}
+	_, args, ok = ResolveDeclaredCallWithSchemas("edit",
+		`{"path":"/tmp/f.txt","oldString":"a","newString":"b","replaceAll":true}`, declared, schemas)
+	if !ok {
+		t.Fatal("edit did not resolve")
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(args), &obj); err != nil {
+		t.Fatalf("edit args are not JSON: %v (%s)", err, args)
+	}
+	if obj["file_path"] != "/tmp/f.txt" || obj["old_string"] != "a" || obj["new_string"] != "b" || obj["replace_all"] != true {
+		t.Fatalf("edit args = %s, want snake_case translation", args)
+	}
+	if _, leaked := obj["path"]; leaked {
+		t.Fatalf("canonical path leaked: %s", args)
+	}
+}
+
+// SchemaUsesCanonicalArgs must see nested properties (AskUserQuestion nests
+// `multiple` inside questions.items) and must not treat a schema that also
+// declares the translated key as canonical.
+func TestSchemaUsesCanonicalArgs(t *testing.T) {
+	question := json.RawMessage(`{"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string"},"multiple":{"type":"boolean"}}}}}}`)
+	if !SchemaUsesCanonicalArgs("question", question) {
+		t.Fatal("nested canonical property was not detected")
+	}
+	mixed := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"file_path":{"type":"string"}}}`)
+	if SchemaUsesCanonicalArgs("read", mixed) {
+		t.Fatal("a schema with the translated key must not be treated as canonical")
+	}
+	if SchemaUsesCanonicalArgs("read", nil) {
+		t.Fatal("a missing schema must not be treated as canonical")
 	}
 }
 
@@ -107,14 +187,28 @@ func TestTranslateToolArguments(t *testing.T) {
 			upstream: "shell",
 			client:   "Bash",
 			args:     `{"command":"sleep 1","background":true}`,
-			want:     `{"command":"sleep 1","run_in_background":true}`,
+			want:     `{"command":"sleep 1","run_in_background":true,"description":"Run a shell command"}`,
 		},
 		{
 			name:     "shell workdir folds into the command",
 			upstream: "shell",
 			client:   "Bash",
 			args:     `{"command":"pwd","workdir":"/tmp/x"}`,
-			want:     `{"command":"cd '/tmp/x' && pwd"}`,
+			want:     `{"command":"cd '/tmp/x' && pwd","description":"Run a shell command"}`,
+		},
+		{
+			name:     "codex exec_command gets cmd and limits",
+			upstream: "shell",
+			client:   "exec_command",
+			args:     `{"command":"pwd","workdir":"/tmp/x"}`,
+			want:     `{"cmd":"pwd","workdir":"/tmp/x","yield_time_ms":10000,"max_output_chars":20000}`,
+		},
+		{
+			name:     "direct codex exec_command maps command and numeric strings",
+			upstream: "exec_command",
+			client:   "exec_command",
+			args:     `{"command":"pwd","yield_time_ms":"10000","max_output_chars":"20000"}`,
+			want:     `{"cmd":"pwd","yield_time_ms":10000,"max_output_chars":20000}`,
 		},
 		{
 			name:     "unrelated tool passes through byte for byte",
@@ -180,6 +274,12 @@ func TestSearchFallbackToBash(t *testing.T) {
 			args:     `{"pattern":"*.go","path":"src"}`,
 			wantCmd:  `rg --files --glob '*.go' 'src' | head -n 100`,
 		},
+		{
+			name:     "websearch without WebSearch becomes DuckDuckGo curl",
+			upstream: "websearch",
+			args:     `{"query":"OpenCode Zen"}`,
+			wantCmd:  `curl -fsSL --max-time 30 -A 'Mozilla/5.0' 'https://html.duckduckgo.com/html/?q=OpenCode+Zen' | grep -oE 'result__a[^>]*>[^<]+' | head -n 8`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -197,6 +297,48 @@ func TestSearchFallbackToBash(t *testing.T) {
 				t.Fatalf("command = %q, want %q", payload.Command, tc.wantCmd)
 			}
 		})
+	}
+}
+
+// Codex declares exec_command but no Edit tool. An edit call must become a
+// shell command that performs the replacement, not a dropped call that ends
+// the turn.
+func TestShellFallbackEditToExecCommand(t *testing.T) {
+	args := `{"path":"/tmp/a.txt","oldString":"alpha","newString":"beta","replaceAll":true}`
+	name, payload, ok := ShellFallback("edit", args, []string{"exec_command", "write_stdin"})
+	if !ok || name != "exec_command" {
+		t.Fatalf("fallback = %q, %v, want exec_command, true", name, ok)
+	}
+	var out struct {
+		Cmd string `json:"cmd"`
+	}
+	if err := json.Unmarshal([]byte(payload), &out); err != nil {
+		t.Fatalf("payload: %v (%s)", err, payload)
+	}
+	if !strings.Contains(out.Cmd, "python3 -c") || !strings.Contains(out.Cmd, "old_string not found") {
+		t.Fatalf("command = %q, want a python3 replacement command", out.Cmd)
+	}
+	const prefix = `b64decode("`
+	start := strings.Index(out.Cmd, prefix)
+	end := strings.Index(out.Cmd, `"))`)
+	if start < 0 || end <= start {
+		t.Fatalf("command has no base64 payload: %q", out.Cmd)
+	}
+	raw, err := base64.StdEncoding.DecodeString(out.Cmd[start+len(prefix) : end])
+	if err != nil {
+		t.Fatalf("base64 payload: %v", err)
+	}
+	var decoded struct {
+		Path string `json:"path"`
+		Old  string `json:"old"`
+		New  string `json:"new"`
+		All  bool   `json:"all"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decoded payload: %v (%s)", err, raw)
+	}
+	if decoded.Path != "/tmp/a.txt" || decoded.Old != "alpha" || decoded.New != "beta" || !decoded.All {
+		t.Fatalf("decoded payload = %#v", decoded)
 	}
 }
 

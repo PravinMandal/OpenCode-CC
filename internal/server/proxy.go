@@ -62,10 +62,18 @@ func (s *Server) Proxy() http.HandlerFunc {
 		hasWebSearch := shouldUseWebSearchShim(&areq)
 		webSearchMode := cfg.ResolveWebSearchMode()
 
-		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
-		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
-		applyOutputConfigEffort(oreq, &areq, targetModel, cfg, s.levelsForModel(targetModel))
-		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
+		buildOReq := func(ar *proxy.AnthropicRequest) *proxy.OpenAIRequest {
+			oreq := proxy.ConvertRequest(ar, func(string) string { return targetModel })
+			// The client replays the tool name it executed (Bash) whose args it
+			// normalised; the upstream tool set is canonical (shell), so put the
+			// model's own call back the way it made it.
+			proxy.RestoreOpenAIHistory(oreq)
+			applyThinkingBudgetMapping(oreq, ar, targetModel, cfg)
+			applyOutputConfigEffort(oreq, ar, targetModel, cfg, s.levelsForModel(targetModel))
+			proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
+			return oreq
+		}
+		oreq := buildOReq(&areq)
 		stickyKey := proxy.AnthropicPromptCacheHint(&areq)
 		if oreq.PromptCacheKey != "" {
 			stickyKey = oreq.PromptCacheKey
@@ -94,46 +102,52 @@ func (s *Server) Proxy() http.HandlerFunc {
 			return
 		}
 
-		// Marshal the upstream request.
-		upBody, err := json.Marshal(oreq)
+		buildUpBody := func(ar *proxy.AnthropicRequest) ([]byte, error) {
+			b, err := json.Marshal(buildOReq(ar))
+			if err != nil {
+				return nil, err
+			}
+			if proxy.IsFreeModel(targetModel) && !s.nativeTransportReady() {
+				return proxy.PrepareFreeChatBody(b)
+			}
+			return b, nil
+		}
+		upBody, err := buildUpBody(&areq)
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not encode upstream request: "+err.Error())
 			return
 		}
 		upstreamStream := areq.Stream
 		if proxy.IsFreeModel(targetModel) {
-			upBody, err = proxy.PrepareFreeChatBody(upBody)
-			if err != nil {
-				writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "could not prepare Zen free-tier request: "+err.Error())
-				return
-			}
 			upstreamStream = true
 		}
 
 		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
-		upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL, bytes.NewReader(upBody))
+		newUpReq := func(b []byte) (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL, bytes.NewReader(b))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+zenKey)
+			// Match the Accept header to the request mode: Zen (and most OpenAI-
+			// compatible servers) gate SSE delivery on Accept: text/event-stream.
+			if upstreamStream {
+				req.Header.Set("Accept", "text/event-stream")
+			} else {
+				req.Header.Set("Accept", "application/json")
+			}
+			req.Header.Set("User-Agent", ocUA())
+			setZenSessionHeaders(req, r.Header, stickyKey)
+			if v := r.Header.Get("anthropic-version"); v != "" {
+				req.Header.Set("anthropic-version", v)
+			}
+			return req, nil
+		}
+		upReq, err := newUpReq(upBody)
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not build upstream request: "+err.Error())
 			return
-		}
-		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("Authorization", "Bearer "+zenKey)
-		// Match the Accept header to the request mode: Zen (and most OpenAI-
-		// compatible servers) gate SSE delivery on Accept: text/event-stream.
-		// Sending application/json on a stream:true request makes some upstreams
-		// refuse with "streaming not supported".
-		if upstreamStream {
-			upReq.Header.Set("Accept", "text/event-stream")
-		} else {
-			upReq.Header.Set("Accept", "application/json")
-		}
-		// Some upstreams prefer a UA.
-		upReq.Header.Set("User-Agent", ocUA())
-		setZenSessionHeaders(upReq, r.Header, stickyKey)
-		// Propagate the anthropic-version / anthropic-beta for observability
-		// on the upstream side (Zen ignores them for the OpenAI path).
-		if v := r.Header.Get("anthropic-version"); v != "" {
-			upReq.Header.Set("anthropic-version", v)
 		}
 
 		httpClient := s.upstreamClient(upstreamStream, timeoutSeconds)
@@ -166,9 +180,42 @@ func (s *Server) Proxy() http.HandlerFunc {
 			}
 			return doUpstreamWithRetry(httpClient, upReq, upBody)
 		}
+		// chatResampleNudged appends the stall text plus one user continuation
+		// turn and forces a tool call. The identical retry often repeats the
+		// same trailer; the forced one cannot.
+		chatResampleNudged := func(stallText string) (*http.Response, error) {
+			if err := r.Context().Err(); err != nil {
+				return nil, err
+			}
+			nudged := areq
+			nudged.Messages = append([]proxy.AnthropicMessage{}, areq.Messages...)
+			if strings.TrimSpace(stallText) != "" {
+				nudged.Messages = append(nudged.Messages, proxy.AnthropicMessage{
+					Role:    "assistant",
+					Content: proxy.AnthropicMessageContent{IsStr: true, Text: stallText},
+				})
+			}
+			nudged.Messages = append(nudged.Messages, proxy.AnthropicMessage{
+				Role: "user",
+				Content: proxy.AnthropicMessageContent{
+					IsStr: true,
+					Text:  "Continue with the tool action you just announced. Use a declared tool now; do not end after another introduction.",
+				},
+			})
+			nudged.ToolChoice = proxy.AnthropicToolChoice{Type: "any"}
+			nb, err := buildUpBody(&nudged)
+			if err != nil {
+				return nil, err
+			}
+			nreq, err := newUpReq(nb)
+			if err != nil {
+				return nil, err
+			}
+			return doUpstreamWithRetry(httpClient, nreq, nb)
+		}
 
 		if areq.Stream {
-			s.handleStreamResponse(w, resp, r, areq.Model, targetModel, body, start, chatResample, s.cfg.BridgeToollessResample)
+			s.handleStreamResponse(w, resp, r, areq.Model, targetModel, body, start, chatResample, chatResampleNudged, s.cfg.BridgeToollessResample)
 		} else if upstreamStream && resp.StatusCode < http.StatusBadRequest &&
 			(strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") || resp.Header.Get("Content-Type") == "") {
 			s.handleAggregatedChatResponse(w, resp, r, areq.Model, targetModel, body, start)
@@ -541,7 +588,7 @@ func (s *Server) handleAggregatedChatResponse(w http.ResponseWriter, resp *http.
 
 // handleStreamResponse proxies the SSE stream, converting each OpenAI chunk to
 // Anthropic events. It flushes continuously so the client sees real-time data.
-func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response, r *http.Request, inModel, target string, reqBody []byte, start time.Time, resample func() (*http.Response, error), resampleEnabled bool) {
+func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response, r *http.Request, inModel, target string, reqBody []byte, start time.Time, resample func() (*http.Response, error), resampleNudged func(string) (*http.Response, error), resampleEnabled bool) {
 	defer resp.Body.Close()
 
 	flusher, ok := w.(http.Flusher)
@@ -608,9 +655,13 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 	// (carrying usage) + message_stop. If the upstream errored mid-stream,
 	// first try the aborted-stream resample (strict guards: no tool content
 	// may exist yet); only then surface the error event.
+	rescued := false
 	if streamErr != nil && streamErr.Error() != "EOF" {
 		if s.maybeResampleAbortedChatStream(r, flusher, conv, resample, resampleEnabled, declaredTools, declaredSchemas, &inputTok, &outputTok, &cachedInputTok, &malformed, streamErr, inModel, target) {
-			// Rescued: fall through to Finalize, which emits tool_use.
+			// Rescued: fall through to Finalize, which emits tool_use. The
+			// scan result still describes the aborted first sample, so the
+			// truncation check below must not run against it.
+			rescued = true
 		} else {
 			_ = conv.EmitError("api_error", "upstream stream error: "+streamErr.Error())
 			stopReason = "stream_error"
@@ -621,7 +672,20 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 			return
 		}
 	}
-	s.maybeResampleToollessChatStream(r, flusher, conv, resample, resampleEnabled, declaredTools, declaredSchemas, &inputTok, &outputTok, &cachedInputTok, &malformed, inModel, target)
+	// A chunked stream that ends without [DONE]/finish_reason is a truncated
+	// turn, not a clean end. The scanner returns io.EOF in that case; treat it
+	// as an upstream failure so the client can retry instead of accepting a
+	// partial answer as complete.
+	if !rescued && r.Context().Err() == nil && scanRes.SawChunk && !scanRes.SawDone && !scanRes.SawFinish {
+		_ = conv.EmitError("api_error", "upstream stream ended before a terminal event")
+		stopReason = "stream_error"
+		_ = conv.Finalize(stopReason)
+		_ = conv.Flush()
+		flusher.Flush()
+		s.logFailed(r.Context(), r, inModel, target, true, http.StatusBadGateway, "upstream_truncated", reqBody, time.Since(start))
+		return
+	}
+	s.maybeResampleToollessChatStream(r, flusher, conv, resample, resampleNudged, resampleEnabled, declaredTools, declaredSchemas, &inputTok, &outputTok, &cachedInputTok, &malformed, inModel, target)
 	_ = conv.Finalize("end_turn")
 	stopReason = conv.StopReason()
 	_ = conv.Flush()
@@ -663,6 +727,7 @@ func (s *Server) maybeResampleToollessChatStream(
 	flusher http.Flusher,
 	conv *proxy.StreamConverter,
 	resample func() (*http.Response, error),
+	resampleNudged func(string) (*http.Response, error),
 	enabled bool,
 	declaredTools []string,
 	declaredSchemas []proxy.AnthropicTool,
@@ -678,15 +743,34 @@ func (s *Server) maybeResampleToollessChatStream(
 	do, verdict := proxy.ShouldResampleToolless(enabled, len(declaredTools),
 		"end_turn", conv.HasToolUse(), len(conv.DroppedCalls()),
 		*outputTok, upstreamStatus)
-	// A streamed thinking block belongs to the first upstream sample. If a
-	// retry won, Claude Code would replay that unrelated reasoning with the
-	// rescued call; there is no way to retract it from the open SSE message.
-	if !do || conv.HasReasoning() {
+	// A thinking block from the first sample is already on the wire. Free-tier
+	// GLM emits reasoning on almost every turn, so refusing every reasoning-
+	// bearing resample was leaving the exact "Call 2:" stall unresolved. The
+	// retry is still restricted to a usable tool call, and the replayed history
+	// keeps the first sample's thinking with its own text; that is preferable
+	// to ending the run at two calls. Only a mid-stream abort (below) still
+	// refuses reasoning, where the fragment cannot be paired safely.
+	if !do {
 		return false
+	}
+	if conv.HasReasoning() {
+		log.Printf("opencode-cc: toolless resample [chat] reasoning present; resampling model=%s target=%s",
+			inModel, target)
 	}
 	log.Printf("opencode-cc: toolless resample [chat] (%s) out=%d upstream_finish=%q model=%s target=%s",
 		verdict, *outputTok, finish, inModel, target)
-	return s.runChatResample(r, flusher, conv, resample, declaredTools, declaredSchemas, inputTok, outputTok, cachedInputTok, malformed, inModel, target)
+	if s.runChatResample(r, flusher, conv, resample, declaredTools, declaredSchemas, inputTok, outputTok, cachedInputTok, malformed, inModel, target) {
+		return true
+	}
+	if resampleNudged == nil {
+		return false
+	}
+	// The identical retry often repeats the same trailer. A forced tool_choice
+	// retry cannot end toolless, so it is the last chance to rescue the turn.
+	log.Printf("opencode-cc: toolless resample [chat] forcing tool choice model=%s target=%s", inModel, target)
+	return s.runChatResample(r, flusher, conv, func() (*http.Response, error) {
+		return resampleNudged(conv.TextHead())
+	}, declaredTools, declaredSchemas, inputTok, outputTok, cachedInputTok, malformed, inModel, target)
 }
 
 // maybeResampleAbortedChatStream retries a mid-stream aborted Chat turn
@@ -781,7 +865,22 @@ func (s *Server) runChatResample(
 			scanErr, inModel, target)
 		return false
 	}
-	if err := candidate.Finalize("end_turn"); err != nil || candidate.StopReason() != "tool_use" {
+	if err := candidate.Finalize("end_turn"); err != nil {
+		log.Printf("opencode-cc: toolless resample [chat] still toolless model=%s target=%s",
+			inModel, target)
+		return false
+	}
+	// A tool call is always replayable. A text-only candidate is replayable
+	// only when the first sample was completely empty: the free tier
+	// occasionally answers with a reasoning-only turn (no text, no tool), and
+	// a harness that receives that records a completed turn with no assistant
+	// result. The second sample's text is a valid answer; a narration-bearing
+	// first sample still requires a real tool call so the rescue cannot append
+	// a second greeting.
+	emptyTurn := strings.TrimSpace(conv.TextHead()) == "" && !conv.HasToolUse()
+	candidateToolUse := candidate.StopReason() == "tool_use"
+	candidateText := strings.TrimSpace(candidate.TextHead()) != "" && len(candidate.DroppedCalls()) == 0
+	if !candidateToolUse && !(emptyTurn && candidateText) {
 		log.Printf("opencode-cc: toolless resample [chat] still toolless model=%s target=%s",
 			inModel, target)
 		return false
@@ -789,7 +888,7 @@ func (s *Server) runChatResample(
 	// The original text is already on the wire. Keep its narration and only
 	// append the newly rescued tool calls; if the first sample was empty,
 	// preserve the second sample's text as well.
-	keepText := conv.TextHead() == ""
+	keepText := emptyTurn
 	for _, chunk := range chunks {
 		if !keepText {
 			for i := range chunk.Choices {
@@ -808,6 +907,11 @@ func (s *Server) runChatResample(
 		flusher.Flush()
 	}
 	*malformed += scanRes.Malformed
+	if !candidateToolUse {
+		log.Printf("opencode-cc: toolless resample [chat] RESCUED (text) model=%s target=%s",
+			inModel, target)
+		return true
+	}
 	log.Printf("opencode-cc: toolless resample [chat] RESCUED model=%s target=%s",
 		inModel, target)
 	return true
@@ -817,33 +921,91 @@ func (s *Server) runChatResample(
 // (~4 chars/token), which is all Claude Code uses it for.
 func (s *Server) CountTokens() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes))
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method must be POST")
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+		if err != nil {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body: "+err.Error())
+			return
+		}
 		var areq proxy.AnthropicRequest
-		_ = json.Unmarshal(body, &areq)
+		if err := json.Unmarshal(body, &areq); err != nil {
+			// A malformed body has no token count. Answering 200 with an
+			// estimate made clients believe the request was understood.
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid Anthropic JSON: "+err.Error())
+			return
+		}
 		tokens := estimateTokens(&areq)
 		writeJSON(w, http.StatusOK, proxy.CountTokensResponse{InputTokens: tokens})
 	}
 }
 
 // estimateTokens returns a rough token count for the request (~4 chars/tok).
+//
+// It must count everything that is billed as input, not just plain text: a
+// tool_result (a file dump, a diff, a command output), a tool_use input, a
+// thinking block and the tool schemas are all prompt tokens. Counting only
+// text made /v1/messages/count_tokens answer ~10x low for agent traffic
+// (measured: a 40K-char tool_result + 4K system + tools -> 1002), which
+// clients use to size their context budget.
 func estimateTokens(areq *proxy.AnthropicRequest) int {
-	total := 0
-	for _, b := range areq.System.Blocks {
-		total += len(b.Text)
+	if areq == nil {
+		return 1
+	}
+	chars := 0
+	for i := range areq.System.Blocks {
+		chars += contentChars(&areq.System.Blocks[i])
 	}
 	for _, m := range areq.Messages {
 		if m.Content.IsStr {
-			total += len(m.Content.Text)
+			chars += len(m.Content.Text)
 			continue
 		}
-		for _, b := range m.Content.Blocks {
-			total += len(b.Text)
+		for i := range m.Content.Blocks {
+			chars += contentChars(&m.Content.Blocks[i])
 		}
 	}
-	if total == 0 {
+	// Tool definitions are part of the prompt on every turn (the canonical set
+	// alone is ~30-38K chars).
+	for _, t := range areq.Tools {
+		chars += len(t.Name) + len(t.Description) + len(t.InputSchema)
+	}
+	if chars == 0 {
 		return 1
 	}
-	return total/4 + 1
+	return chars/4 + 1
+}
+
+// contentChars returns the billable text size of one content block. Images and
+// other media carry no comparable text length, so they are billed at a flat
+// 1500-token estimate (1 token ~= 4 chars), the documented mid-range for a
+// Claude-sized image.
+func contentChars(b *proxy.AnthropicContent) int {
+	if b == nil {
+		return 0
+	}
+	n := len(b.Text) + len(b.Thinking) + len(b.Name) + len(b.ToolUseID) + len(b.Input)
+	if b.Source != nil {
+		n += 1500 * 4
+	}
+	if b.Content != nil {
+		if b.Content.IsStr {
+			n += len(b.Content.Text)
+		} else {
+			for i := range b.Content.Blocks {
+				n += contentChars(&b.Content.Blocks[i])
+			}
+		}
+	}
+	if n == 0 {
+		// Unknown block shape: keep its raw bytes rather than silently dropping
+		// it from the estimate.
+		n = len(b.Raw)
+	}
+	return n
 }
 
 // ---- logging helpers ----
@@ -1093,8 +1255,12 @@ func filterUndeclaredToolUses(resp *proxy.AnthropicResponse, tools []proxy.Anthr
 		return nil
 	}
 	declared := make([]string, 0, len(tools))
+	schemas := make(map[string]json.RawMessage, len(tools))
 	for _, tool := range tools {
 		declared = append(declared, tool.Name)
+		if tool.Name != "" && len(tool.InputSchema) > 0 {
+			schemas[tool.Name] = tool.InputSchema
+		}
 	}
 	filtered := resp.Content[:0]
 	var removed []string
@@ -1104,13 +1270,16 @@ func filterUndeclaredToolUses(resp *proxy.AnthropicResponse, tools []proxy.Anthr
 			// ("default.Bash") and free-tier marker ("shell"/"read") names
 			// rewrite to the declared equivalent instead of stalling the
 			// agent loop with a text-only end_turn.
+			originalName, originalArgs := block.Name, string(block.Input)
 			name, ok := proxy.ResolveDeclaredToolName(block.Name, declared)
 			if ok {
-				block.Input = json.RawMessage(proxy.TranslateToolArguments(block.Name, name, string(block.Input)))
+				block.Input = json.RawMessage(proxy.TranslateToolArgumentsForSchema(block.Name, name, string(block.Input), schemas[name]))
 				block.Name = name
-			} else if fbName, fbArgs, fbOK := proxy.SearchFallback(block.Name, string(block.Input), declared); fbOK {
+				proxy.RememberTranslatedCall(block.ID, originalName, originalArgs, block.Name, string(block.Input))
+			} else if fbName, fbArgs, fbOK := proxy.ResolveDeclaredCallWithSchemas(block.Name, string(block.Input), declared, schemas); fbOK {
 				block.Name = fbName
 				block.Input = json.RawMessage(fbArgs)
+				proxy.RememberTranslatedCall(block.ID, originalName, originalArgs, block.Name, string(block.Input))
 			} else {
 				removed = append(removed, block.Name)
 				continue

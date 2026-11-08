@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kiowx/opencode-cc/internal/config"
 	"github.com/Kiowx/opencode-cc/internal/proxy"
@@ -293,6 +294,63 @@ func TestWebSearchNativeModePassesThroughMessages(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "native search") {
 		t.Fatalf("native response was not relayed: %s", rr.Body.String())
+	}
+}
+
+// TestSyntheticStreamToolUseUsesInputDelta guards the cliproxyapi path: Anthropic
+// streams tool arguments as input_json_delta events, and a whole input object on
+// content_block_start is read by CPA as an empty argument object.
+func TestSyntheticStreamToolUseUsesInputDelta(t *testing.T) {
+	srv, _ := newTestServer(t, "http://127.0.0.1:1")
+	var resp proxy.AnthropicResponse
+	if err := json.Unmarshal([]byte(`{
+		"id":"msg_test",
+		"type":"message",
+		"role":"assistant",
+		"model":"test-model",
+		"content":[{"type":"tool_use","id":"toolu_1","name":"exec_command","input":{"cmd":"pwd"}}],
+		"stop_reason":"tool_use",
+		"usage":{"input_tokens":3,"output_tokens":2}
+	}`), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	rr := httptest.NewRecorder()
+	srv.writeSyntheticAnthropicStream(rr, req, "test-model", "test-model", []byte(`{}`), time.Now(), &resp)
+
+	var startInput map[string]any
+	var partial string
+	for _, line := range strings.Split(rr.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			continue
+		}
+		switch ev["type"] {
+		case "content_block_start":
+			cb, _ := ev["content_block"].(map[string]any)
+			if cb["type"] == "tool_use" {
+				startInput, _ = cb["input"].(map[string]any)
+			}
+		case "content_block_delta":
+			delta, _ := ev["delta"].(map[string]any)
+			if delta["type"] == "input_json_delta" {
+				s, _ := delta["partial_json"].(string)
+				partial += s
+			}
+		}
+	}
+	if startInput == nil || len(startInput) != 0 {
+		t.Fatalf("tool_use content_block_start must carry empty input, got %#v\n%s", startInput, rr.Body.String())
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(partial), &args); err != nil {
+		t.Fatalf("input_json_delta did not assemble valid JSON: %q (%v)", partial, err)
+	}
+	if args["cmd"] != "pwd" {
+		t.Fatalf("input_json_delta args = %#v, want cmd=pwd", args)
 	}
 }
 

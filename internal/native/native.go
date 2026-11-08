@@ -141,12 +141,15 @@ func (m *Manager) Stop() {
 	if !m.Enabled() {
 		return
 	}
+	// Signal the supervisor before checking `started`: a SIGTERM in the
+	// window before run() closes that channel would otherwise return here
+	// and leave the supervisor free to spawn Bun after the parent exits.
+	m.stopOnce.Do(func() { close(m.stop) })
 	select {
 	case <-m.started:
 	default:
 		return // never started
 	}
-	m.stopOnce.Do(func() { close(m.stop) })
 	m.mu.RLock()
 	cmd := m.cmd
 	m.mu.RUnlock()
@@ -156,6 +159,12 @@ func (m *Manager) Stop() {
 	select {
 	case <-m.done:
 	case <-time.After(6 * time.Second):
+		// Stop may have snapshotted nil before spawn() published the child.
+		// Re-read so the fallback kills the process that is actually
+		// running; run() has the matching check after setRunning.
+		m.mu.RLock()
+		cmd = m.cmd
+		m.mu.RUnlock()
 		if cmd != nil && cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
@@ -163,6 +172,36 @@ func (m *Manager) Stop() {
 		case <-m.done:
 		case <-time.After(2 * time.Second):
 		}
+	}
+}
+
+// stopping reports whether Stop has been called.
+func (m *Manager) stopping() bool {
+	select {
+	case <-m.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+// terminate stops a child that Stop could not signal because the manager had
+// not published it yet, and reaps it. run() must not call Wait afterwards.
+func (m *Manager) terminate(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	waited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-waited
 	}
 }
 
@@ -240,6 +279,15 @@ func (m *Manager) run() {
 		m.setRunning(cmd, port)
 		m.readyOnce.Do(func() { close(m.ready) })
 		log.Printf("opencode-cc: native free-tier transport on 127.0.0.1:%d (pid %d)", port, cmd.Process.Pid)
+
+		// Stop may have run between spawn() returning and setRunning: it
+		// snapshotted a nil command and could not signal this child. Kill it
+		// here instead of letting it outlive the parent.
+		if m.stopping() {
+			m.terminate(cmd)
+			m.clearRunning(cmd)
+			return
+		}
 
 		err = cmd.Wait()
 		m.clearRunning(cmd)
@@ -351,7 +399,12 @@ func (m *Manager) stage() error {
 	if err := os.MkdirAll(m.dir, 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(m.identityDir, 0o755); err != nil {
+	if err := os.MkdirAll(m.identityDir, 0o700); err != nil {
+		return err
+	}
+	// MkdirAll only applies the mode on creation. An older install created
+	// this directory 0755; the captures and session store in it are private.
+	if err := os.Chmod(m.identityDir, 0o700); err != nil {
 		return err
 	}
 	for _, name := range []string{"transport.mjs", "capture.mjs"} {

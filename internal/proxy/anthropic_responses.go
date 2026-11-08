@@ -224,9 +224,18 @@ func anthropicMessagesToResponsesInput(messages []AnthropicMessage) ([]any, erro
 				if strings.TrimSpace(args) == "" {
 					args = "{}"
 				}
+				name := b.Name
+				// The client replays the call it received: its own tool name
+				// and translated arguments. Restore the canonical call the
+				// model actually made so replayed history matches the tools
+				// declared upstream. Without this the model sees exec_command
+				// in history, cannot find it in its tool list, and stalls.
+				if restoredName, restoredArgs, ok := RestoreTranslatedCall(callID, b.Name, args); ok {
+					name, args = restoredName, restoredArgs
+				}
 				items = append(items, map[string]any{
 					"type": "function_call", "call_id": callID,
-					"name": b.Name, "arguments": args,
+					"name": name, "arguments": args,
 				})
 			case "tool_result":
 				flushAssistantText()

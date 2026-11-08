@@ -221,12 +221,16 @@ func responsesInputToAnthropicMessages(raw json.RawMessage) ([]AnthropicMessage,
 			if reasoning == "" {
 				reasoning = cachedReasoningForToolCalls([]string{callID})
 			}
+			name, args := item.Name, item.Arguments
+			if restoredName, restoredArgs, ok := RestoreTranslatedCall(callID, name, args); ok {
+				name, args = restoredName, restoredArgs
+			}
 			blocks := reasoningAnthropicBlocks(reasoning)
 			blocks = append(blocks, AnthropicContent{
 				Type:  "tool_use",
 				ID:    callID,
-				Name:  item.Name,
-				Input: responsesArgumentsToAnthropicInput(item.Arguments),
+				Name:  name,
+				Input: responsesArgumentsToAnthropicInput(args),
 			})
 			cacheReasoningForToolCalls(reasoning, callID)
 			appendAnthropicMessage(&messages, "assistant", blocks)
@@ -459,12 +463,16 @@ func responsesInputToMessages(raw json.RawMessage) ([]OpenAIMessage, error) {
 			if reasoning == "" {
 				reasoning = cachedReasoningForToolCalls([]string{callID})
 			}
+			name, args := item.Name, item.Arguments
+			if restoredName, restoredArgs, ok := RestoreTranslatedCall(callID, name, args); ok {
+				name, args = restoredName, restoredArgs
+			}
 			appendResponsesToolCall(&out, OpenAIToolCall{
 				ID:   callID,
 				Type: "function",
 				Function: OpenAIFunctionCall{
-					Name:      item.Name,
-					Arguments: canonicalJSONString(item.Arguments),
+					Name:      name,
+					Arguments: canonicalJSONString(args),
 				},
 			}, reasoning)
 			cacheReasoningForToolCalls(reasoning, callID)
@@ -910,6 +918,11 @@ type responsesReasoningState struct {
 type responsesToolState struct {
 	item        ResponsesOutputItem
 	outputIndex int
+	origName    string
+	// emitted records whether output_item.added went to the client. A
+	// restricted call that cannot resolve is dropped before any event, so
+	// the stream never shows an item that the final response omits.
+	emitted bool
 }
 
 // ResponsesStreamConverter converts Chat Completions chunks to Responses API
@@ -926,6 +939,12 @@ type ResponsesStreamConverter struct {
 	text      *responsesTextState
 	tools     map[int]*responsesToolState
 	order     []int
+
+	allowedNames []string
+	restricted   bool
+	// schemas maps a declared name to its input schema; a client that
+	// declares the canonical argument shape is not translated.
+	schemas map[string]json.RawMessage
 
 	inputTokens       int
 	outputTokens      int
@@ -956,6 +975,24 @@ func NewResponsesStreamConverter(w io.Writer, model string) (*ResponsesStreamCon
 		return nil, err
 	}
 	return converter, nil
+}
+
+// RestrictTools limits emitted function calls to names declared by the
+// downstream client, resolving canonical names and translating arguments.
+// Without it the Responses bridge emits canonical names (write, shell) that
+// clients like DSH validate against their own schemas and reject. An empty,
+// non-nil list means the client declared no tools: every function call is
+// phantom and must be dropped.
+func (c *ResponsesStreamConverter) RestrictTools(names []string) {
+	c.RestrictToolsWithSchemas(names, nil)
+}
+
+// RestrictToolsWithSchemas is RestrictTools with the declared input schemas,
+// so canonical-schema clients pass through untranslated.
+func (c *ResponsesStreamConverter) RestrictToolsWithSchemas(names []string, schemas map[string]json.RawMessage) {
+	c.allowedNames = append([]string(nil), names...)
+	c.schemas = schemas
+	c.restricted = names != nil
 }
 
 // HandleChunk emits Responses events for one Chat Completions chunk.
@@ -1142,41 +1179,102 @@ func (c *ResponsesStreamConverter) handleTool(tool OpenAIToolCall) error {
 				CallID: callID,
 				Name:   tool.Function.Name,
 			},
-			outputIndex: c.nextIndex,
 		}
-		c.nextIndex++
 		c.tools[tool.Index] = state
 		c.order = append(c.order, tool.Index)
-		if err := c.writeEvent("response.output_item.added", map[string]any{
-			"type":         "response.output_item.added",
-			"output_index": state.outputIndex,
-			"item": map[string]any{
-				"id":        state.item.ID,
-				"type":      "function_call",
-				"status":    "in_progress",
-				"call_id":   state.item.CallID,
-				"name":      state.item.Name,
-				"arguments": "",
-			},
-		}); err != nil {
-			return err
-		}
 	}
 	if tool.ID != "" {
 		state.item.CallID = tool.ID
 	}
 	if tool.Function.Name != "" {
-		state.item.Name = tool.Function.Name
+		if state.origName == "" {
+			state.origName = tool.Function.Name
+			state.item.Name = tool.Function.Name
+		} else if !state.emitted {
+			// The name is a streamed string like the arguments. Resolving
+			// only the first fragment turned a split `read` into `re`, which
+			// no fallback can express. The added event is not emitted until
+			// the call resolves, so appending here cannot rewrite a name the
+			// client has already seen; the helper ignores a repeated
+			// complete name.
+			state.origName = AppendToolNameFragment(state.origName, tool.Function.Name, c.allowedNames)
+			state.item.Name = state.origName
+		}
 	}
-	if tool.Function.Arguments == "" {
+	if err := c.emitToolAdded(state); err != nil {
+		return err
+	}
+	if tool.Function.Arguments != "" {
+		state.item.Arguments += tool.Function.Arguments
+	}
+	if !state.emitted || tool.Function.Arguments == "" {
+		// A restricted call whose name is not resolvable yet is buffered
+		// whole. Emitting argument deltas before output_item.added would
+		// leave the client holding fragments for an item the final
+		// response may omit.
 		return nil
 	}
-	state.item.Arguments += tool.Function.Arguments
+	if c.restricted {
+		// Finalize rewrites the arguments to the client tool's schema
+		// (file_path/old_string/queries/prompt...). Streaming the raw
+		// canonical fragments here would make the concatenated deltas
+		// disagree with the done event, so restricted calls deliver their
+		// arguments in response.function_call_arguments.done only.
+		return nil
+	}
 	return c.writeEvent("response.function_call_arguments.delta", map[string]any{
 		"type":         "response.function_call_arguments.delta",
 		"item_id":      state.item.ID,
 		"output_index": state.outputIndex,
 		"delta":        tool.Function.Arguments,
+	})
+}
+
+// emitToolAdded writes response.output_item.added once, and only once the
+// call is known to survive Finalize. Restricted calls wait for a resolvable
+// declared name, so a dropped call never leaves a dangling added event.
+func (c *ResponsesStreamConverter) emitToolAdded(state *responsesToolState) error {
+	if state.emitted {
+		return nil
+	}
+	if c.restricted {
+		if state.origName == "" {
+			return nil
+		}
+		resolved, ok := ResolveDeclaredToolName(state.origName, c.allowedNames)
+		if !ok {
+			return nil
+		}
+		state.item.Name = resolved
+	}
+	return c.writeToolAdded(state)
+}
+
+// writeToolAdded emits the added event for a call that Finalize already
+// resolved, including a shell-fallback call whose upstream name has no
+// declared equivalent.
+func (c *ResponsesStreamConverter) writeToolAdded(state *responsesToolState) error {
+	if state.emitted {
+		return nil
+	}
+	state.emitted = true
+	// Assign the output index only now, when the call is known to survive.
+	// Reserving one at creation left holes whenever a restricted call was
+	// dropped, so the streamed output_index no longer matched the final
+	// response.output array.
+	state.outputIndex = c.nextIndex
+	c.nextIndex++
+	return c.writeEvent("response.output_item.added", map[string]any{
+		"type":         "response.output_item.added",
+		"output_index": state.outputIndex,
+		"item": map[string]any{
+			"id":        state.item.ID,
+			"type":      "function_call",
+			"status":    "in_progress",
+			"call_id":   state.item.CallID,
+			"name":      state.item.Name,
+			"arguments": "",
+		},
 	})
 }
 
@@ -1193,7 +1291,7 @@ func (c *ResponsesStreamConverter) Finalize() error {
 		}
 	}
 
-	output := make([]ResponsesOutputItem, c.nextIndex)
+	items := make(map[int]ResponsesOutputItem, c.nextIndex)
 	if c.reasoning != nil {
 		text := c.reasoning.text.String()
 		part := ResponsesReasoningSummary{
@@ -1201,7 +1299,7 @@ func (c *ResponsesStreamConverter) Finalize() error {
 			Text: text,
 		}
 		item := completedReasoningItem(c.reasoning.id, text)
-		output[c.reasoning.outputIndex] = item
+		items[c.reasoning.outputIndex] = item
 		if err := c.writeEvent("response.reasoning_summary_text.done", map[string]any{
 			"type":          "response.reasoning_summary_text.done",
 			"item_id":       c.reasoning.id,
@@ -1236,7 +1334,7 @@ func (c *ResponsesStreamConverter) Finalize() error {
 			Annotations: []any{},
 		}
 		item := completedMessageItem(c.text.id, text)
-		output[c.text.outputIndex] = item
+		items[c.text.outputIndex] = item
 		if err := c.writeEvent("response.output_text.done", map[string]any{
 			"type":          "response.output_text.done",
 			"item_id":       c.text.id,
@@ -1266,8 +1364,30 @@ func (c *ResponsesStreamConverter) Finalize() error {
 	}
 	for _, index := range c.order {
 		state := c.tools[index]
+		if c.restricted {
+			originalArgs := state.item.Arguments
+			resolvedName, resolvedArgs, ok := ResolveDeclaredCallWithSchemas(state.origName, state.item.Arguments, c.allowedNames, c.schemas)
+			if !ok {
+				// Undeclared with no expressible fallback: drop the call
+				// instead of handing the client a name it will reject. No
+				// added event was emitted, so the stream stays consistent.
+				continue
+			}
+			// Remember the model-facing call so the next request's history
+			// can be rewritten back from the client tool (e.g. exec_command)
+			// to the canonical tool the model actually used. Without this the
+			// model sees its own fallback call and loops on it.
+			if resolvedName != state.origName || resolvedArgs != originalArgs {
+				RememberTranslatedCall(state.item.CallID, state.origName, originalArgs, resolvedName, resolvedArgs)
+			}
+			state.item.Name = resolvedName
+			state.item.Arguments = resolvedArgs
+			if err := c.writeToolAdded(state); err != nil {
+				return err
+			}
+		}
 		state.item.Status = "completed"
-		output[state.outputIndex] = state.item
+		items[state.outputIndex] = state.item
 		if c.reasoning != nil {
 			cacheReasoningForToolCalls(c.reasoning.text.String(), state.item.CallID)
 		}
@@ -1286,6 +1406,15 @@ func (c *ResponsesStreamConverter) Finalize() error {
 			"item":         state.item,
 		}); err != nil {
 			return err
+		}
+	}
+
+	// Every index is assigned only when its item is actually emitted, so the
+	// array is dense and its positions match the streamed output_index.
+	output := make([]ResponsesOutputItem, c.nextIndex)
+	for index, item := range items {
+		if index >= 0 && index < len(output) {
+			output[index] = item
 		}
 	}
 

@@ -67,10 +67,10 @@ func TestConvertAnthropicHistoryRoundTrip(t *testing.T) {
 			{Role: "assistant", Content: AnthropicMessageContent{Blocks: []AnthropicContent{
 				{Type: "thinking", Thinking: "should check"},
 				{Type: "text", Text: "checking"},
-				{Type: "tool_use", ID: "call_1", Name: "get_weather", Input: jsonRawMessage(`{"city":"Paris"}`)},
+				{Type: "tool_use", ID: "call_roundtrip_1", Name: "get_weather", Input: jsonRawMessage(`{"city":"Paris"}`)},
 			}}},
 			{Role: "user", Content: AnthropicMessageContent{Blocks: []AnthropicContent{
-				{Type: "tool_result", ToolUseID: "call_1", Content: &AnthropicMessageContent{Text: "sunny", IsStr: true}},
+				{Type: "tool_result", ToolUseID: "call_roundtrip_1", Content: &AnthropicMessageContent{Text: "sunny", IsStr: true}},
 			}}},
 		},
 	}, "muse-spark-1.3-contributor-free", BridgeOptions{})
@@ -96,11 +96,11 @@ func TestConvertAnthropicHistoryRoundTrip(t *testing.T) {
 	if req.Input[1].Type != "message" || req.Input[1].Role != "assistant" {
 		t.Errorf("assistant history item: %+v", req.Input[1])
 	}
-	if req.Input[2].Type != "function_call" || req.Input[2].CallID != "call_1" ||
+	if req.Input[2].Type != "function_call" || req.Input[2].CallID != "call_roundtrip_1" ||
 		req.Input[2].Name != "get_weather" || !strings.Contains(req.Input[2].Arguments, "Paris") {
 		t.Errorf("function_call item: %+v", req.Input[2])
 	}
-	if req.Input[3].Type != "function_call_output" || req.Input[3].CallID != "call_1" ||
+	if req.Input[3].Type != "function_call_output" || req.Input[3].CallID != "call_roundtrip_1" ||
 		req.Input[3].Output != "sunny" {
 		t.Errorf("function_call_output item: %+v", req.Input[3])
 	}

@@ -128,8 +128,14 @@ func TestChatToollessResampleDoesNotRepeatText(t *testing.T) {
 			srv, _ := newTestServerWithCfg(t, cfg)
 			rec := httptest.NewRecorder()
 			srv.Proxy().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(chatLoopBody(t))))
-			if rec.Code != http.StatusOK || hits != 2 {
-				t.Fatalf("status=%d hits=%d body=%s", rec.Code, hits, rec.Body.String())
+			// Without a rescue, the identical resample is followed by the
+			// forced-tool-choice retry, so three upstream POSTs are expected.
+			wantHits := 3
+			if rescue {
+				wantHits = 2
+			}
+			if rec.Code != http.StatusOK || hits != wantHits {
+				t.Fatalf("status=%d hits=%d want=%d body=%s", rec.Code, hits, wantHits, rec.Body.String())
 			}
 			body := rec.Body.String()
 			if strings.Count(body, `"text":"first greeting"`) != 1 || strings.Contains(body, `"text":"second greeting"`) {
@@ -150,9 +156,11 @@ func TestChatToollessResampleDoesNotRepeatText(t *testing.T) {
 	}
 }
 
-// A first sample's already-streamed thinking cannot be undone or paired
-// with a different sample's tool call in the next-turn reasoning history.
-func TestChatToollessResampleKeepsOriginalThinking(t *testing.T) {
+// Reasoning-bearing stalls are now resampled: free-tier GLM emits reasoning on
+// almost every turn, so refusing the retry left "Call 2:" runs stuck at two
+// calls. When the retry is still toolless the original thinking/text/verdict
+// is preserved; a rescued call appends after the first sample's thinking.
+func TestChatToollessResampleAllowsReasoningBearingStall(t *testing.T) {
 	hits := 0
 	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -169,9 +177,11 @@ func TestChatToollessResampleKeepsOriginalThinking(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.Proxy().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(chatLoopBody(t))))
 	body := rec.Body.String()
-	if rec.Code != http.StatusOK || hits != 1 || !strings.Contains(body, `"thinking":"first reasoning"`) ||
+	// The identical resample is followed by the forced-tool-choice retry;
+	// neither yields a tool call here, so both are discarded.
+	if rec.Code != http.StatusOK || hits != 3 || !strings.Contains(body, `"thinking":"first reasoning"`) ||
 		strings.Count(body, `"text":"first greeting"`) != 1 || !strings.Contains(body, `"stop_reason":"end_turn"`) {
-		t.Errorf("unsafe thinking retry: status=%d hits=%d body=%s", rec.Code, hits, body)
+		t.Errorf("reasoning resample changed the answer: status=%d hits=%d body=%s", rec.Code, hits, body)
 	}
 }
 
@@ -255,6 +265,12 @@ func TestChatAbortedStreamResample(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("rescued stream missing %q:\n%s", want, body)
 		}
+	}
+	// A successful rescue replaces the aborted sample; the client must not
+	// also receive the truncation error event, which Anthropic clients treat
+	// as terminal.
+	if strings.Contains(body, `"type":"error"`) {
+		t.Errorf("rescued stream emitted a fatal error event:\n%s", body)
 	}
 }
 
@@ -1366,4 +1382,93 @@ func TestProxyForwardsOutputConfigEffort(t *testing.T) {
 	}
 	rows, _ := st.ListRequests(context.Background(), 1)
 	t.Fatalf("effort was not logged: %+v", rows)
+}
+
+// TestChatToollessResampleReplaysTextAfterEmptyTurn covers the empty-turn
+// shape that broke Codex: the first sample carries reasoning but no visible
+// text and no tool call, so the harness records a completed turn with no
+// assistant result. A text-only retry is a valid answer for an empty first
+// sample and must be replayed (a narration-bearing first sample still needs a
+// real tool call).
+func TestChatToollessResampleReplaysTextAfterEmptyTurn(t *testing.T) {
+	hits := 0
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits == 1 {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"reasoning_content":"thinking only"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"usage":{"prompt_tokens":10,"completion_tokens":77}}`+"\n\n")
+		} else {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"recovered answer"}}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"usage":{"prompt_tokens":10,"completion_tokens":5}}`+"\n\n")
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer zen.Close()
+	cfg := config.Default()
+	cfg.UpstreamBase, cfg.ZenAPIKey = zen.URL, "test-key"
+	cfg.BridgeToollessResample = true
+	srv, _ := newTestServerWithCfg(t, cfg)
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(chatLoopBody(t))))
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || hits != 2 ||
+		!strings.Contains(body, `"text":"recovered answer"`) ||
+		!strings.Contains(body, `"stop_reason":"end_turn"`) ||
+		!strings.Contains(body, `"output_tokens":5`) {
+		t.Errorf("empty turn not rescued with retry text: status=%d hits=%d body=%s", rec.Code, hits, body)
+	}
+}
+
+// TestProxyForwardsOutputConfigEffortToReasoningEffort proves the
+// effort-2025-11-24 path end to end: Claude Code sends thinking.type=adaptive
+// with the level in output_config.effort, and a model mapped to the
+// reasoning_effort channel must actually carry that level upstream. Before the
+// fix the adaptive type short-circuited the mapping and the second effort
+// pass skipped mapped models, so the request ran at the provider default.
+func TestProxyForwardsOutputConfigEffortToReasoningEffort(t *testing.T) {
+	var got struct {
+		Model           string `json:"model"`
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-effort",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+		}`)
+	}))
+	defer zen.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBase = zen.URL
+	cfg.ZenAPIKey = "test-key"
+	cfg.NativeAnthropic = false
+	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: ""}}
+	cfg.ThinkingBudgetMappings = []config.ThinkingBudgetMapping{
+		{Match: "deepseek-v4.1-flash-free", Field: "reasoning_effort"},
+	}
+	srv, _ := newTestServerWithCfg(t, cfg)
+
+	body := []byte(`{
+		"model":"deepseek-v4.1-flash-free",
+		"max_tokens":64,
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"max"},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got.ReasoningEffort != "max" {
+		t.Fatalf("upstream reasoning_effort = %q, want max", got.ReasoningEffort)
+	}
 }

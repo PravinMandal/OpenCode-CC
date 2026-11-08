@@ -77,6 +77,14 @@ func (s *Server) handleWebSearchShim(
 		if !ok {
 			aresp := proxy.ConvertResponse(queryResp, areq.Model)
 			filterUndeclaredToolUses(aresp, areq.Tools)
+			// Empty visible content is not an answer: the free tier answers
+			// reasoning-only turns with an empty message. Declaring the native
+			// web_search tool must not disable every other tool in the same
+			// request, so fall through to the normal chat path instead of
+			// returning the empty query-generation sample as the turn.
+			if !hasVisibleAnthropicContent(aresp) {
+				return false
+			}
 			if areq.Stream {
 				s.writeSyntheticAnthropicStream(w, r, areq.Model, targetModel, reqBody, start, aresp)
 			} else {
@@ -238,7 +246,11 @@ func (s *Server) writeSyntheticAnthropicStream(
 				})
 			}
 			write("content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
-		case "server_tool_use":
+		case "server_tool_use", "tool_use":
+			// Anthropic streams tool input as content_block_start{input:{}},
+			// then input_json_delta. Sending the whole object on start works
+			// for Claude Code but downstream translators (cliproxyapi) read
+			// only the deltas and hand the client an empty arguments object.
 			startBlock := block
 			startBlock.Input = json.RawMessage(`{}`)
 			write("content_block_start", map[string]any{
@@ -295,6 +307,23 @@ func shouldUseWebSearchShim(areq *proxy.AnthropicRequest) bool {
 	}
 	for _, tool := range areq.Tools {
 		if proxy.IsAnthropicWebSearchTool(tool) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasVisibleAnthropicContent reports whether a converted response carries
+// text or a tool call. A thinking-only or empty message is not usable as an
+// answer: several clients drop it and record a completed turn with no result.
+func hasVisibleAnthropicContent(resp *proxy.AnthropicResponse) bool {
+	for _, block := range resp.Content {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				return true
+			}
+		case "tool_use":
 			return true
 		}
 	}

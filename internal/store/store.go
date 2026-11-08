@@ -8,6 +8,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +24,12 @@ type Store struct {
 
 // Open opens (or creates) the database at path and initialises the schema.
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)"
+	// journal_size_limit caps the WAL file after a checkpoint; without it the
+	// WAL grows to whatever the busiest write burst needed and never shrinks
+	// (measured 50MB). wal_autocheckpoint keeps it bounded during a long run.
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(on)&_pragma=journal_size_limit(4194304)" +
+		"&_pragma=wal_autocheckpoint(1000)&_pragma=synchronous(NORMAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -39,6 +47,15 @@ func Open(path string) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
+	}
+	// The DB stores API-key hashes and request bodies. A manual run with
+	// umask 022 would otherwise leave it 0644; the data dir is 0700 now, but
+	// tighten the file too so a copied or relocated DB stays private.
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			db.Close()
+			return nil, fmt.Errorf("chmod sqlite %s: %w", p, err)
+		}
 	}
 	return s, nil
 }
@@ -146,6 +163,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at          INTEGER NOT NULL DEFAULT 0,
     expires_at          INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 `
 
 // RequestRow is the Go representation of a logged request.
@@ -179,6 +201,112 @@ type RequestRow struct {
 	APIKeyID    int64  `json:"api_key_id"`
 }
 
+// Maintain trims old request rows and returns the WAL file to the OS.
+//
+// requests is an append-only log with no natural bound: at agent traffic rates
+// it grows without limit, bloating the database the panel has to scan. The
+// hourly aggregates in stats_hourly are tiny and stay, so charts and lifetime
+// totals survive the trim. olderThan zero skips the age cutoff; maxRows <= 0
+// skips the row cap.
+func (s *Store) Maintain(ctx context.Context, olderThan time.Time, maxRows int) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	if !olderThan.IsZero() {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM requests WHERE ts < ?`, olderThan.UnixMilli()); err != nil {
+			return fmt.Errorf("delete old requests: %w", err)
+		}
+	}
+	if maxRows > 0 {
+		if _, err := s.db.ExecContext(ctx, `
+DELETE FROM requests WHERE id NOT IN (
+    SELECT id FROM requests ORDER BY ts DESC, id DESC LIMIT ?
+)`, maxRows); err != nil {
+			return fmt.Errorf("trim request log: %w", err)
+		}
+	}
+	// Checkpoint even when nothing was trimmed: this is what applies
+	// journal_size_limit, so a WAL left large by an earlier version shrinks on
+	// the first maintenance pass. On an idle database it is nearly free.
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("wal checkpoint: %w", err)
+	}
+	return nil
+}
+
+// Vacuum compacts the database file after a large trim. It rewrites the whole
+// file, so callers should run it rarely (weekly) and only when the free-page
+// ratio justifies it.
+func (s *Store) Vacuum(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `VACUUM`)
+	return err
+}
+
+// secretPatterns redact credential-shaped values before a request body is
+// persisted. The panel keeps the request metadata and the shape of the body;
+// it must never keep a usable key, bearer token, or password.
+var secretPatterns = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`\b(?:oc_)?sk[_-][A-Za-z0-9_-]{16,}`), `[REDACTED]`},
+	{regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9._\-]{16,}`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)(authorization:\s*(?:basic|bearer)\s+)\S+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)(x-api-key\s*[:=]\s*)\S+`), `${1}[REDACTED]`},
+	// Telegram bot token: <bot id>:<secret>, bare or in the
+	// https://api.telegram.org/bot<id>:<secret>/... URL form. It arrives in
+	// tool output and in error bodies far more often than in a JSON field.
+	{regexp.MustCompile(`\b(?:bot)?\d{6,12}:[A-Za-z0-9_-]{30,}\b`), `[REDACTED]`},
+	{regexp.MustCompile(`\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b`), `[REDACTED]`},
+	{regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`), `[REDACTED]`},
+	{regexp.MustCompile(`(?i)("(?:api[_-]?key|zen_api_key|access_token|refresh_token|id_token|password|secret|token)"\s*:\s*")[^"]*(")`), `${1}[REDACTED]${2}`},
+	// Environment-style assignments: OPENAI_API_KEY=..., GITHUB_TOKEN=...,
+	// DB_PASSWORD=... . They appear both as real lines (tool output) and
+	// inside JSON strings where the newline is the two characters `\n`.
+	// Stop the value at whitespace, a quote, a backslash or a comma so a
+	// JSON body keeps its shape instead of redacting the rest of the line.
+	{regexp.MustCompile(`(?im)(^|\\n|\n)(\s*(?:export\s+)?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*)[^\s"\\,]+`), `${1}${2}[REDACTED]`},
+}
+
+func redactSecrets(s string) string {
+	for _, p := range secretPatterns {
+		s = p.re.ReplaceAllString(s, p.repl)
+	}
+	return s
+}
+
+// MetaInt reads an integer value from the meta key/value table. ok is false
+// when the key is absent or holds a non-integer value.
+func (s *Store) MetaInt(ctx context.Context, key string) (int64, bool) {
+	if s == nil || s.db == nil || key == "" {
+		return 0, false
+	}
+	var raw string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key).Scan(&raw); err != nil {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// SetMetaInt writes an integer value to the meta table. Maintenance uses it to
+// remember the last VACUUM across restarts; process uptime is not a schedule.
+func (s *Store) SetMetaInt(ctx context.Context, key string, value int64) error {
+	if s == nil || s.db == nil || key == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO meta (key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, strconv.FormatInt(value, 10))
+	return err
+}
+
 // InsertRequest writes one request row and bumps the hourly stats atomically.
 func (s *Store) InsertRequest(ctx context.Context, r *RequestRow) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -186,6 +314,11 @@ func (s *Store) InsertRequest(ctx context.Context, r *RequestRow) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	r.ReqBody = redactSecrets(r.ReqBody)
+	r.RespBody = redactSecrets(r.RespBody)
+	r.RespHeaders = redactSecrets(r.RespHeaders)
+	r.Error = redactSecrets(r.Error)
 
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO requests

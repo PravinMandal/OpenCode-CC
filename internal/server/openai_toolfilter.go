@@ -39,6 +39,10 @@ type chatCallKey struct {
 // when the name arrived.
 type chatToolCallFilter struct {
 	declared []string
+	// schemas maps a declared tool name to its input schema, so a client
+	// that already uses the canonical OpenCode argument shape is not
+	// translated (native OpenCode declares read/write/edit with `path`).
+	schemas map[string]json.RawMessage
 
 	// verdicts records keep/drop per call key.
 	verdicts map[chatCallKey]bool
@@ -46,13 +50,157 @@ type chatToolCallFilter struct {
 	// trailing finish_reason:"tool_calls" can be corrected to "stop" when
 	// every call was dropped.
 	keptAny map[int]bool
+	// pending buffers argument fragments for calls whose canonical shape
+	// differs from the client tool. The consolidated call is emitted only
+	// once the full JSON is available, so argument keys/defaults can be
+	// translated (DSH's bash requires description, read requires file_path,
+	// websearch requires a queries array).
+	pending map[chatCallKey]*chatPendingCall
 
 	droppedNames []string
 	renamedFrom  []string
 }
 
+// chatPendingCall accumulates one streamed tool call until its arguments are
+// complete enough to translate.
+type chatPendingCall struct {
+	id       string
+	name     string
+	resolved string
+	args     strings.Builder
+	emitted  bool
+	// first is the fragment that introduced the call. Keeping it lets the
+	// consolidated call preserve wire fields such as `index`, which SDK
+	// accumulators key on, without inventing them.
+	first map[string]json.RawMessage
+}
+
+// chatArgsNeedTranslation reports whether a client tool's argument schema
+// differs from the canonical tool's, so the call must be buffered and
+// translated rather than relayed fragment by fragment. Invalid (still
+// streaming) JSON for a translated tool is buffered; a pure name rename with
+// already-compatible arguments passes through untouched.
+func chatArgsNeedTranslation(name, args string, schema json.RawMessage) bool {
+	if proxy.SchemaUsesCanonicalArgs(name, schema) {
+		return false
+	}
+	var obj map[string]any
+	valid := json.Unmarshal([]byte(args), &obj) == nil && obj != nil
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "shell", "exec_command", "shell_command", "run_command":
+		if !valid {
+			return true
+		}
+		for _, key := range []string{"command", "cmd", "workdir", "timeout", "background", "run_in_background"} {
+			if _, ok := obj[key]; ok {
+				return true
+			}
+		}
+		return false
+	case "read", "write":
+		if !valid {
+			return true
+		}
+		_, hasPath := obj["path"]
+		return hasPath
+	case "edit":
+		if !valid {
+			return true
+		}
+		for _, key := range []string{"path", "oldString", "newString", "replaceAll"} {
+			if _, ok := obj[key]; ok {
+				return true
+			}
+		}
+		return false
+	case "webfetch":
+		// WebFetch requires `prompt`; the canonical tool has only `url`.
+		// TranslateToolArguments fills the default, so the call must be
+		// buffered even when no canonical-only key is present.
+		return true
+	case "websearch":
+		if !valid {
+			return true
+		}
+		_, hasQuery := obj["query"]
+		return hasQuery
+	case "grep":
+		if !valid {
+			return true
+		}
+		for _, key := range []string{"include", "limit", "literal", "caseSensitive"} {
+			if _, ok := obj[key]; ok {
+				return true
+			}
+		}
+		return false
+	case "glob":
+		if !valid {
+			return true
+		}
+		for _, key := range []string{"hidden", "limit"} {
+			if _, ok := obj[key]; ok {
+				return true
+			}
+		}
+		return false
+	case "skill":
+		if !valid {
+			return true
+		}
+		_, hasID := obj["id"]
+		return hasID
+	case "subagent":
+		if !valid {
+			return true
+		}
+		for _, key := range []string{"agent", "background", "sessionID"} {
+			if _, ok := obj[key]; ok {
+				return true
+			}
+		}
+		return false
+	case "question":
+		if !valid {
+			return true
+		}
+		return containsJSONKey(obj, "multiple")
+	}
+	return false
+}
+
+// containsJSONKey reports whether a decoded JSON value carries key anywhere in
+// its object/array tree. AskUserQuestion nests the canonical `multiple` flag
+// inside each question object, not at the top level.
+func containsJSONKey(v any, key string) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		if _, ok := t[key]; ok {
+			return true
+		}
+		for _, sub := range t {
+			if containsJSONKey(sub, key) {
+				return true
+			}
+		}
+	case []any:
+		for _, sub := range t {
+			if containsJSONKey(sub, key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // newChatToolCallFilter builds a filter for the client-declared tool names.
 func newChatToolCallFilter(declared []string) *chatToolCallFilter {
+	return newChatToolCallFilterWithSchemas(declared, nil)
+}
+
+// newChatToolCallFilterWithSchemas additionally records each declared tool's
+// input schema so canonical-schema clients pass through untranslated.
+func newChatToolCallFilterWithSchemas(declared []string, schemas map[string]json.RawMessage) *chatToolCallFilter {
 	clean := make([]string, 0, len(declared))
 	for _, d := range declared {
 		if d = strings.TrimSpace(d); d != "" {
@@ -61,8 +209,10 @@ func newChatToolCallFilter(declared []string) *chatToolCallFilter {
 	}
 	return &chatToolCallFilter{
 		declared: clean,
+		schemas:  schemas,
 		verdicts: map[chatCallKey]bool{},
 		keptAny:  map[int]bool{},
+		pending:  map[chatCallKey]*chatPendingCall{},
 	}
 }
 
@@ -97,30 +247,83 @@ func dedupe(in []string) []string {
 // verdictFor decides a call's fate. An unlabelled fragment (no name yet) is
 // passed through unchanged: it will be judged when its name arrives, and
 // inventing a decision here would either leak or swallow a legitimate call.
-func (f *chatToolCallFilter) verdictFor(key chatCallKey, name string) (keep bool, decided bool) {
+// buffer reports that the name has no declared equivalent yet but a
+// shell/search fallback might express it once the arguments are complete.
+func (f *chatToolCallFilter) verdictFor(key chatCallKey, name string) (keep bool, buffer bool, decided bool) {
 	if v, ok := f.verdicts[key]; ok {
-		return v, true
+		return v, false, true
 	}
 	if strings.TrimSpace(name) == "" {
-		return true, false
+		return true, false, false
 	}
 	if len(f.declared) == 0 {
 		// Client declared no tools: every call is phantom.
 		f.verdicts[key] = false
 		f.droppedNames = append(f.droppedNames, name)
-		return false, true
+		return false, false, true
 	}
 	resolved, ok := proxy.ResolveDeclaredToolName(name, f.declared)
 	if !ok {
-		f.verdicts[key] = false
-		f.droppedNames = append(f.droppedNames, name)
-		return false, true
+		// No declared tool carries this name, but the client's shell can
+		// still run an equivalent read/write/edit/grep/glob/webfetch/
+		// websearch. The fallback needs the complete arguments, so defer
+		// the decision instead of dropping the call here.
+		return false, true, true
 	}
 	f.verdicts[key] = true
 	if resolved != name {
 		f.renamedFrom = append(f.renamedFrom, name+"->"+resolved)
 	}
-	return true, true
+	return true, false, true
+}
+
+// finishPending translates a buffered call and appends it to kept. A call
+// buffered because its name had no declared equivalent is resolved through
+// the shell/search fallbacks now that its arguments are complete; when no
+// fallback exists it is dropped and recorded.
+func (f *chatToolCallFilter) finishPending(key chatCallKey, p *chatPendingCall, kept *[]map[string]json.RawMessage, choice int) {
+	if p.name == "" {
+		// A call whose stream never carried a name is not executable. Emitting
+		// it would hand the client a nameless tool call; dropping it lets the
+		// finish_reason correction below close the turn cleanly.
+		p.emitted = true
+		f.verdicts[key] = false
+		return
+	}
+	args := p.args.String()
+	name := p.resolved
+	translated := args
+	if name == "" {
+		resolved, outArgs, ok := proxy.ResolveDeclaredCallWithSchemas(p.name, args, f.declared, f.schemas)
+		if !ok {
+			p.emitted = true
+			f.verdicts[key] = false
+			f.droppedNames = append(f.droppedNames, p.name)
+			return
+		}
+		name, translated = resolved, outArgs
+		if name != p.name {
+			f.renamedFrom = append(f.renamedFrom, p.name+"->"+name)
+		}
+	} else {
+		translated = proxy.TranslateToolArgumentsForSchema(p.name, name, args, f.schemas[name])
+	}
+	if name != p.name || translated != args {
+		proxy.RememberTranslatedCall(p.id, p.name, args, name, translated)
+	}
+	*kept = append(*kept, toolCallFromParts(p.first, p.id, name, translated))
+	f.keptAny[choice] = true
+	p.emitted = true
+}
+
+// cloneCallDelta copies one raw tool-call fragment so a buffered call can keep
+// the wire fields (notably `index`) of the fragment that introduced it.
+func cloneCallDelta(call map[string]json.RawMessage) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(call))
+	for k, v := range call {
+		out[k] = v
+	}
+	return out
 }
 
 // filterChatToolCalls rewrites one SSE "data:" line of an OpenAI Chat
@@ -173,21 +376,105 @@ func (f *chatToolCallFilter) filterChatToolCalls(line []byte) ([]byte, bool) {
 									callIdx = n
 								}
 							}
+							key := chatCallKey{choice: idx, call: callIdx}
+
+							// A call being buffered for argument translation:
+							// append this fragment and emit the consolidated
+							// call as soon as its JSON is complete.
+							if p := f.pending[key]; p != nil {
+								// The id can arrive in a later fragment than
+								// the one that introduced the call. Keep it
+								// for the consolidated call and the history
+								// record.
+								if p.id == "" {
+									if id := toolCallID(call); id != "" {
+										p.id = id
+									}
+								}
+								// The name is a streamed string like the
+								// arguments: a split name must be rebuilt
+								// before a shell fallback can resolve it.
+								// The helper ignores a repeated complete name.
+								if p.resolved == "" {
+									if n := toolCallName(call); n != "" {
+										p.name = proxy.AppendToolNameFragment(p.name, n, f.declared)
+									}
+								}
+								p.args.WriteString(toolCallArguments(call))
+								callsChanged = true
+								if !p.emitted && json.Valid([]byte(p.args.String())) {
+									f.finishPending(key, p, &kept, idx)
+								}
+								continue
+							}
+
 							name := toolCallName(call)
-							keep, decided := f.verdictFor(chatCallKey{choice: idx, call: callIdx}, name)
+							keep, buffer, decided := f.verdictFor(key, name)
 							if !decided {
-								// Argument-only fragment of a call whose name
-								// has not arrived yet: pass through untouched.
-								kept = append(kept, call)
-								f.keptAny[idx] = true
+								// No name has arrived yet. Buffer instead of
+								// relaying: if the call turns out to be
+								// undeclared, a relayed fragment would already
+								// be on the client's wire with no name to
+								// resolve. A later fragment supplies the name.
+								p := &chatPendingCall{
+									id:    toolCallID(call),
+									first: cloneCallDelta(call),
+								}
+								p.args.WriteString(toolCallArguments(call))
+								f.pending[key] = p
+								callsChanged = true
+								continue
+							}
+							if buffer {
+								// No declared name yet; a shell/search
+								// fallback may express it once the arguments
+								// are complete.
+								p := &chatPendingCall{
+									id:    toolCallID(call),
+									name:  name,
+									first: cloneCallDelta(call),
+								}
+								p.args.WriteString(toolCallArguments(call))
+								f.pending[key] = p
+								callsChanged = true
+								if json.Valid([]byte(p.args.String())) {
+									f.finishPending(key, p, &kept, idx)
+								}
 								continue
 							}
 							if !keep {
 								callsChanged = true
 								continue
 							}
+							resolved, _ := proxy.ResolveDeclaredToolName(name, f.declared)
+							if resolved == "" {
+								resolved = name
+							}
+							args := toolCallArguments(call)
+							// Buffer a renamed call whose arguments are still
+							// streaming even when its keys need no translation:
+							// the remembered canonical args must be the complete
+							// object, and only the first fragment carries the
+							// upstream name.
+							if chatArgsNeedTranslation(name, args, f.schemas[resolved]) ||
+								(resolved != name && !json.Valid([]byte(args))) {
+								p := &chatPendingCall{
+									id:       toolCallID(call),
+									name:     name,
+									resolved: resolved,
+									first:    cloneCallDelta(call),
+								}
+								p.args.WriteString(toolCallArguments(call))
+								f.pending[key] = p
+								callsChanged = true
+								if json.Valid([]byte(p.args.String())) {
+									f.finishPending(key, p, &kept, idx)
+								}
+								continue
+							}
 							f.keptAny[idx] = true
-							if resolved, ok := proxy.ResolveDeclaredToolName(name, f.declared); ok && resolved != name {
+							if resolved != name {
+								proxy.RememberTranslatedCall(toolCallID(call), name, toolCallArguments(call), resolved, toolCallArguments(call))
 								if setToolCallName(call, resolved) {
 									callsChanged = true
 								}
@@ -210,6 +497,74 @@ func (f *chatToolCallFilter) filterChatToolCalls(line []byte) ([]byte, bool) {
 							}
 							changed = true
 						}
+					}
+				}
+			}
+		}
+
+		// Flush any buffered call whose arguments never reached complete JSON
+		// before the choice finished. Dropping it here produces an empty
+		// finish_reason:"stop" turn: the model sees its call vanish and the
+		// agent loop stalls. Emitting the best-effort call lets the client
+		// return a schema error that the model can correct on the next turn.
+		if rawFinish, ok := choice["finish_reason"]; ok && string(bytes.TrimSpace(rawFinish)) != "null" {
+			var finish string
+			if json.Unmarshal(rawFinish, &finish) == nil && finish != "" {
+				keys := make([]chatCallKey, 0, len(f.pending))
+				for key, p := range f.pending {
+					if key.choice == idx && !p.emitted {
+						keys = append(keys, key)
+					}
+				}
+				sort.Slice(keys, func(i, j int) bool { return keys[i].call < keys[j].call })
+				if len(keys) > 0 {
+					flush := make([]map[string]json.RawMessage, 0, len(keys))
+					for _, key := range keys {
+						p := f.pending[key]
+						args := p.args.String()
+						if p.resolved == "" {
+							// Buffered for a shell/search fallback, but the
+							// arguments never became valid JSON. There is no
+							// safe call to emit.
+							p.emitted = true
+							f.verdicts[key] = false
+							f.droppedNames = append(f.droppedNames, p.name)
+							continue
+						}
+						if json.Valid([]byte(args)) {
+							translated := proxy.TranslateToolArgumentsForSchema(p.name, p.resolved, args, f.schemas[p.resolved])
+							if p.resolved != p.name || translated != args {
+								proxy.RememberTranslatedCall(p.id, p.name, args, p.resolved, translated)
+							}
+							args = translated
+						}
+						flush = append(flush, toolCallFromParts(p.first, p.id, p.resolved, args))
+						p.emitted = true
+						f.keptAny[idx] = true
+					}
+					if len(flush) > 0 {
+						var delta map[string]json.RawMessage
+						if rawDelta, hasDelta := choice["delta"]; hasDelta {
+							_ = json.Unmarshal(rawDelta, &delta)
+						}
+						if delta == nil {
+							delta = map[string]json.RawMessage{}
+						}
+						var existing []map[string]json.RawMessage
+						if rawCalls, ok := delta["tool_calls"]; ok {
+							_ = json.Unmarshal(rawCalls, &existing)
+						}
+						merged := append(existing, flush...)
+						if encoded, err := json.Marshal(merged); err == nil {
+							delta["tool_calls"] = encoded
+						}
+						if encoded, err := json.Marshal(delta); err == nil {
+							choice["delta"] = encoded
+						}
+						if finish == "stop" {
+							choice["finish_reason"] = json.RawMessage(`"tool_calls"`)
+						}
+						changed = true
 					}
 				}
 			}
@@ -258,6 +613,61 @@ func toolCallName(call map[string]json.RawMessage) string {
 		return ""
 	}
 	return name
+}
+
+// toolCallArguments extracts the streamed function.arguments fragment.
+func toolCallArguments(call map[string]json.RawMessage) string {
+	rawFn, ok := call["function"]
+	if !ok {
+		return ""
+	}
+	var fn map[string]json.RawMessage
+	if json.Unmarshal(rawFn, &fn) != nil {
+		return ""
+	}
+	rawArgs, ok := fn["arguments"]
+	if !ok {
+		return ""
+	}
+	var args string
+	if json.Unmarshal(rawArgs, &args) != nil {
+		return ""
+	}
+	return args
+}
+
+// toolCallID extracts the streamed call id (empty when not yet present).
+func toolCallID(call map[string]json.RawMessage) string {
+	raw, ok := call["id"]
+	if !ok {
+		return ""
+	}
+	var id string
+	if json.Unmarshal(raw, &id) != nil {
+		return ""
+	}
+	return id
+}
+
+// toolCallFromParts builds the consolidated delta for a translated call.
+func toolCallFromParts(base map[string]json.RawMessage, id, name, args string) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(base)+3)
+	for k, v := range base {
+		out[k] = v
+	}
+	if id != "" {
+		out["id"], _ = json.Marshal(id)
+	}
+	out["type"] = json.RawMessage(`"function"`)
+	fn, err := json.Marshal(map[string]any{
+		"name":      name,
+		"arguments": args,
+	})
+	if err != nil {
+		return out
+	}
+	out["function"] = fn
+	return out
 }
 
 // setToolCallName rewrites function.name in a raw tool-call delta.
@@ -311,6 +721,38 @@ func declaredOpenAIToolNames(body []byte) []string {
 		if t.Name != "" {
 			out = append(out, t.Name)
 		}
+	}
+	return out
+}
+
+// declaredOpenAIToolSchemas extracts each declared function's input schema,
+// so argument translation can be skipped for canonical-schema clients.
+func declaredOpenAIToolSchemas(body []byte) map[string]json.RawMessage {
+	var payload struct {
+		Tools []struct {
+			Function struct {
+				Name       string          `json:"name"`
+				Parameters json.RawMessage `json:"parameters"`
+			} `json:"function"`
+			Name       string          `json:"name"` // Responses-style shape
+			Parameters json.RawMessage `json:"parameters"`
+		} `json:"tools"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(payload.Tools))
+	for _, t := range payload.Tools {
+		name, schema := t.Function.Name, t.Function.Parameters
+		if name == "" {
+			name, schema = t.Name, t.Parameters
+		}
+		if name != "" && len(schema) > 0 {
+			out[name] = schema
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

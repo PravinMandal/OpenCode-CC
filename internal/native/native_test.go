@@ -23,28 +23,50 @@ func TestReadyPort(t *testing.T) {
 	}
 }
 
-// The free tier's quota is per public IP/64, and rotation is an operator-only
-// decision. The transport must never probe, retry, or spawn the reset engine
-// on a 429, and must default to the canonical tool prefix: extra client tools
-// make the request look like an unknown client and turn every turn into a
-// shape 429 followed by a retry.
-func TestTransportHasNoAutomaticQuotaRecovery(t *testing.T) {
+// The free tier's quota is per public IP/64. Rotation is approved only through
+// the shared request-reset engine, which owns the radio and the reset lock. A
+// request may try a bounded number of established lease ids, ask for exactly
+// one reset, and mint exactly one fresh id after that reset; it must not probe
+// the budget, spin, or invent its own egress rotation.
+func TestTransportQuotaRecoveryIsBounded(t *testing.T) {
 	raw, err := assets.ReadFile("transport.mjs")
 	if err != nil {
 		t.Fatal(err)
 	}
 	src := string(raw)
 	for _, forbidden := range []string{
-		"recoverQuota(", "stockProbe(", "canonicalOnlyBody(", "request-reset.mjs",
+		"stockProbe(", "canonicalOnlyBody(",
 	} {
 		if strings.Contains(src, forbidden) {
-			t.Errorf("transport must not contain %q: automatic quota recovery/retry is forbidden", forbidden)
+			t.Errorf("transport must not contain %q", forbidden)
 		}
 	}
 	for _, required := range []string{
 		"tools_suppressed",
+		"tools_unavailable_pruned",
 		"BRIDGE_CLIENT_TOOL_EXTRAS",
-		`headers.set("x-oc-reset", "manual")`,
+		"recoverQuota(",
+		"request-reset.mjs",
+		`RESET_ALLOW_AUTOMATIC: "1"`,
+		// One reset and one fresh id after it; the lease pool is the only other
+		// fallback and is bounded. The deadline stops a request that would spin,
+		// and the reset wait is raced against that deadline so a 600s reset
+		// cannot pin every inflight slot behind a 270s request budget.
+		"if (!resetDone)",
+		"if (!freshAfterResetDone)",
+		"leaseFallbacks < LEASE_FALLBACK_ATTEMPTS",
+		"LEASE_FALLBACK_ATTEMPTS || LEASE_POOL_LIMIT",
+		"quota_reset_skipped_deadline",
+		"Promise.race([recoverQuota(",
+		"postResetGrace",
+		"upstream_deadline",
+		"upstream request deadline exceeded",
+		`passThrough429(response, text, "failed")`,
+		`passThrough429(response, text, "manual")`,
+		`passThrough429(response, text, "shape")`,
+		"automaticRecovery: true",
+		"x-oc-native",
+		"tool_index_rejected",
 	} {
 		if !strings.Contains(src, required) {
 			t.Errorf("transport is missing %q", required)
@@ -106,5 +128,69 @@ func TestManagerLifecycle(t *testing.T) {
 	}
 	if _, _, err := m.Endpoint(); err == nil {
 		t.Error("expected an error after Stop")
+	}
+}
+
+// TestNativeTransportReviewFixes pins the fixes that are not reachable from
+// Go: prune every dead canonical tool (not just the trailing suffix), rewrite
+// the <env> block safely for paths with spaces/$ , and reclaim a stale reset
+// lock instead of waiting out the full budget.
+func TestNativeTransportReviewFixes(t *testing.T) {
+	raw, err := assets.ReadFile("transport.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	for _, required := range []string{
+		// Prune all dead tools, not a prefix/suffix slice.
+		"canonicalTools.filter((t, i) => runnableFlags[i])",
+		"canonicalTools.filter((t, i) => !runnableFlags[i])",
+		// Env rewrite: trust only system/developer, tolerate spaces, use
+		// function replacers so $ in a path is not a replacement pattern.
+		`m?.role !== "system" && m?.role !== "developer"`,
+		"function cleanCwd(raw)",
+		"block => block",
+		"prefix) => prefix + cwd",
+		"prefix) => prefix + repo",
+		"BRIDGE_REWRITE_ENV",
+		// Stale reset lock: PID liveness plus heartbeat age.
+		"function resetLockStale()",
+		"function resetLockOwnerAlive()",
+		"RESET_LOCK_STALE_MS",
+		"process.kill(pid, 0)",
+		// Trace bodies are private.
+		"writeFile(tracePath, body, { mode: 0o600 })",
+		// Alias parity with the Go resolver.
+		`exec_command: "shell"`,
+		`view_file: "read"`,
+		`create_file: "write"`,
+		`str_replace: "edit"`,
+	} {
+		if !strings.Contains(src, required) {
+			t.Errorf("transport is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"lastRunnable",             // suffix-only pruning
+		"`$1${cwd}`",               // replacement-pattern interpolation
+		"Bun.write(join(TRACE_DIR", // world-readable trace
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Errorf("transport still contains %q", forbidden)
+		}
+	}
+
+	capture, err := assets.ReadFile("capture.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"await rename(tmp, target)",
+		"mode: 0o600",
+		"await rename(tmp, primary)",
+	} {
+		if !strings.Contains(string(capture), required) {
+			t.Errorf("capture.mjs is missing %q", required)
+		}
 	}
 }

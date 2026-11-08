@@ -141,8 +141,11 @@
 - The free tier accepts the captured 13 OpenCode tools. Appending client tools
   makes the request look like an unknown client: 19 tools 429ed while the same
   turn at 13 returned 200 (2026-11-02). The sidecar sends canonical-only and
-  translates each call back to the client's tool name and arguments. A 429 is
-  returned as-is: never probe, retry, or rotate the network automatically.
+  translates each call back to the client's tool name and arguments. A
+  non-quota 429 is returned as-is. A free-tier `FreeUsageLimitError` is
+  IP-scoped: the sidecar may invoke the shared `request-reset.mjs` engine once
+  (`--source=opencode-cc`, `RESET_ALLOW_AUTOMATIC=1`) and retry the request
+  once. Never probe the budget, rotate the egress yourself, or retry in a loop.
 - OpenCode CLI and T3 OpenCode stay direct to opencode.ai. CPA fronts Claude,
   Codex, Antigravity and LFM3 only. CPA has exactly one `opencode-cc` Claude
   provider, and both free aliases (`oc/...`) live on it.

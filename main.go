@@ -14,7 +14,7 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -37,8 +37,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve data dir: %v", err)
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
+	if err := os.MkdirAll(abs, 0o700); err != nil {
 		log.Fatalf("create data dir: %v", err)
+	}
+	// The data dir holds the config, API-key hashes and request logs. Repair a
+	// pre-existing 0755 directory from an older build; a manual (non-service)
+	// run with umask 022 must not leave them world-readable.
+	if err := os.Chmod(abs, 0o700); err != nil {
+		log.Printf("WARNING: tighten data dir permissions: %v", err)
 	}
 
 	cfg, err := config.Load(abs)
@@ -72,15 +78,37 @@ func main() {
 	}
 
 	// Graceful shutdown on Ctrl+C / service stop.
+	serveErr := make(chan error, 1)
 	go func() {
-		if err := srv.Start(handler); err != nil {
-			log.Fatalf("server: %v", err)
-		}
+		serveErr <- srv.Start(handler)
 	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("server: %v", err)
+			// Start failed (e.g. the port is taken). Still tear down the
+			// sidecar, background loops and database before exiting;
+			// log.Fatalf skipped every defer and orphaned the Bun process.
+			if shutdownErr := srv.Shutdown(); shutdownErr != nil {
+				log.Printf("shutdown: %v", shutdownErr)
+			}
+			if closeErr := st.Close(); closeErr != nil {
+				log.Printf("close database: %v", closeErr)
+			}
+			os.Exit(1)
+		}
+		return
+	case <-sig:
+	}
+
 	log.Printf("shutting down...")
-	_ = context.Background()
+	// Shutdown closes the keep-alive and retention loops, stops the Bun
+	// sidecar (a whole process group) and drains in-flight requests. Without
+	// this every restart orphaned the sidecar until its parent died.
+	if err := srv.Shutdown(); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
 }

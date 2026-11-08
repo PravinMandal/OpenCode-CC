@@ -415,8 +415,12 @@ func (c *StreamConverter) bufferTool(index int, id, name, args string) {
 	if id != "" && st.id == "" {
 		st.id = id
 	}
-	if name != "" && st.name == "" {
-		st.name = name
+	if name != "" {
+		// The name is a streamed string like the arguments: a split `read`
+		// arrives as `re` + `ad`. A provider may also repeat a complete name;
+		// the helper prefers the longer form only when it is a real declared
+		// tool, so a repeat cannot become `readread`.
+		st.name = AppendToolNameFragment(st.name, name, c.allowedNames)
 	}
 	st.args.WriteString(args)
 }
@@ -438,11 +442,17 @@ func (c *StreamConverter) emitBufferedTool(st *pendingChatTool) error {
 			}
 			// The model saw the canonical OpenCode schema; the client
 			// executes its own. Rewrite argument keys (path->file_path,
-			// id->skill, ...) so the call is valid where it runs.
-			args = TranslateToolArguments(name, resolved, args)
+			// id->skill, ...) so the call is valid where it runs — unless
+			// the client already declares the canonical shape.
+			args = TranslateToolArgumentsForSchema(name, resolved, args, c.declaredSchemas[resolved])
 			name = resolved
 		} else if fbName, fbArgs, fbOK := SearchFallback(name, args, c.allowedNames); fbOK {
-			// Grep/Glob not declared: keep search working through Bash.
+			// Grep/Glob/WebSearch not declared: keep search working through Bash.
+			name, args = fbName, fbArgs
+			c.renamedToolCalls++
+		} else if fbName, fbArgs, fbOK := ShellFallback(name, args, c.allowedNames); fbOK {
+			// File/network tools not declared (e.g. webfetch, or Codex edit/read/write):
+			// fall back to shell so the turn does not stall.
 			name, args = fbName, fbArgs
 			c.renamedToolCalls++
 		} else {
@@ -489,6 +499,11 @@ func (c *StreamConverter) emitBufferedTool(st *pendingChatTool) error {
 		args = "{}"
 	}
 	normalised := ensureToolID(st.id)
+	// Remember the canonical call before the client-facing rewrite so the
+	// next request's replayed history can be restored to it.
+	if st.name != "" && (name != st.name || args != strings.TrimSpace(st.args.String())) {
+		RememberTranslatedCall(normalised, st.name, strings.TrimSpace(st.args.String()), name, args)
+	}
 	idx := c.nextIdx
 	c.nextIdx++
 	c.toolIDs = append(c.toolIDs, normalised)
@@ -623,12 +638,12 @@ func (c *StreamConverter) Finalize(stopReason string) error {
 		if reason != "length" {
 			reason = "tool_calls"
 		}
-	} else if reason != "length" && len(c.droppedCalls) > 0 && c.textHead.Len() == 0 {
-		// Every call was dropped and the model produced no visible text.
-		// This is the exact shape that used to surface as a thinking-only
-		// end_turn: Claude Code then injects "no visible output, please
-		// continue", the model retries the same dropped call, and the turn
-		// stalls in a loop. Say what happened instead.
+	} else if reason != "length" && len(c.droppedCalls) > 0 {
+		// Every call was dropped. This used to surface as a thinking-only
+		// end_turn (or a silent end_turn after text): Claude Code then injects
+		// "no visible output, please continue", the model retries the same
+		// dropped call, and the turn stalls in a loop. Say what happened
+		// instead, even when some text was already emitted.
 		if err := c.emitDropNotice(); err != nil {
 			return err
 		}

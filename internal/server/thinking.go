@@ -45,7 +45,12 @@ func applyThinkingBudgetMapping(req *proxy.OpenAIRequest, areq *proxy.AnthropicR
 			req.ThinkingBudget = &budget
 		}
 	case "reasoning_effort":
-		if thinkingType != "enabled" {
+		// Only an explicit budget pins the level here. Adaptive thinking
+		// (the effort-2025-11-24 channel) carries no budget; its level lives in
+		// output_config.effort and applyOutputConfigEffort forwards it below.
+		// Requiring type=="enabled" made every adaptive request fall through and
+		// run at the provider default, silently ignoring the client's level.
+		if thinkingType != "enabled" || budgetTokens <= 0 {
 			return
 		}
 		req.ReasoningEffort = thinkingLevel(budgetTokens)
@@ -56,12 +61,21 @@ func applyThinkingBudgetMapping(req *proxy.OpenAIRequest, areq *proxy.AnthropicR
 
 // outputConfigEffortFor returns the chat `reasoning_effort` implied by a
 // client's output_config.effort (the effort-2025-11-24 beta channel used by
-// current Claude Code and T3), or "" when the field is absent.
+// current Claude Code and T3), or "" when the field is absent. Newer clients
+// also put the level in thinking.effort; that is the second, weaker source.
 func outputConfigEffortFor(areq *proxy.AnthropicRequest, levels []string) string {
-	if areq == nil || areq.OutputConfig == nil {
+	if areq == nil {
 		return ""
 	}
-	return proxy.ChatEffortFor(areq.OutputConfig.Effort, levels)
+	if areq.OutputConfig != nil {
+		if effort := proxy.ChatEffortFor(areq.OutputConfig.Effort, levels); effort != "" {
+			return effort
+		}
+	}
+	if areq.Thinking != nil {
+		return proxy.ChatEffortFor(areq.Thinking.Effort, levels)
+	}
+	return ""
 }
 
 // applyOutputConfigEffort carries output_config.effort onto the chat bridge's
@@ -74,12 +88,15 @@ func applyOutputConfigEffort(req *proxy.OpenAIRequest, areq *proxy.AnthropicRequ
 	}
 	// A thinking-budget mapping already chose how this model takes its effort
 	// (thinking object / budget / reasoning_effort); that is the more specific
-	// instruction, so don't stack a second channel on top.
+	// instruction, so don't stack a second channel on top. The exception is a
+	// mapping whose channel IS reasoning_effort: then output_config.effort is
+	// the level for that same channel, not a second one.
 	if req.ReasoningEffort != "" {
 		return
 	}
 	if cfg != nil {
-		if _, ok := cfg.ResolveThinkingBudgetMapping(targetModel); ok {
+		if mapping, ok := cfg.ResolveThinkingBudgetMapping(targetModel); ok &&
+			strings.ToLower(mapping.Field) != "reasoning_effort" {
 			return
 		}
 	}

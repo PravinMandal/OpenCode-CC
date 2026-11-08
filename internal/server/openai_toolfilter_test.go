@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/Kiowx/opencode-cc/internal/proxy"
 )
 
 // applyFilter runs one SSE data line through the filter and returns the
@@ -452,4 +453,277 @@ func TestChatProxyPlainStreamUntouchedEndToEnd(t *testing.T) {
 		t.Fatalf("finish_reason altered on a plain stream: %s", raw)
 	}
 	assertSSEFraming(t, raw)
+}
+
+// firstFilteredCall extracts the first consolidated tool call from a filtered
+// SSE data line.
+func firstFilteredCall(t *testing.T, line string) (name, args string) {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal([]byte(line), &root); err != nil {
+		t.Fatalf("filtered line is not JSON: %v\n%s", err, line)
+	}
+	choices, _ := root["choices"].([]any)
+	if len(choices) == 0 {
+		t.Fatalf("no choices in filtered line: %s", line)
+	}
+	choice, _ := choices[0].(map[string]any)
+	delta, _ := choice["delta"].(map[string]any)
+	calls, _ := delta["tool_calls"].([]any)
+	if len(calls) == 0 {
+		t.Fatalf("no tool_calls in filtered line: %s", line)
+	}
+	call, _ := calls[0].(map[string]any)
+	fn, _ := call["function"].(map[string]any)
+	name, _ = fn["name"].(string)
+	args, _ = fn["arguments"].(string)
+	return name, args
+}
+
+// DSH's bash requires a description and has no workdir field. A canonical
+// shell call must be renamed and have both keys translated before the client
+// sees it.
+func TestFilterTranslatesShellArgumentsForDSHBash(t *testing.T) {
+	f := newChatToolCallFilter([]string{"bash"})
+	line := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\",\"workdir\":\"/tmp/x\"}"}}]},"finish_reason":null}]}`
+
+	out := applyFilter(t, f, line)
+	name, args := firstFilteredCall(t, out)
+
+	if name != "bash" {
+		t.Fatalf("expected bash, got %q: %s", name, out)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(args), &obj); err != nil {
+		t.Fatalf("translated args are not JSON: %v\n%s", err, args)
+	}
+	if obj["description"] == nil {
+		t.Fatalf("description missing from DSH bash call: %s", args)
+	}
+	if _, ok := obj["workdir"]; ok {
+		t.Fatalf("workdir leaked to DSH bash: %s", args)
+	}
+	cmd, _ := obj["command"].(string)
+	if !strings.Contains(cmd, "cd '/tmp/x' && pwd") {
+		t.Fatalf("workdir was not folded into command: %s", cmd)
+	}
+}
+
+// DSH's read takes file_path, not the canonical path key.
+func TestFilterTranslatesReadArgumentsForDSH(t *testing.T) {
+	f := newChatToolCallFilter([]string{"read"})
+	line := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"/tmp/f.txt\"}"}}]},"finish_reason":null}]}`
+
+	out := applyFilter(t, f, line)
+	name, args := firstFilteredCall(t, out)
+
+	if name != "read" {
+		t.Fatalf("expected read, got %q: %s", name, out)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(args), &obj); err != nil {
+		t.Fatalf("translated args are not JSON: %v\n%s", err, args)
+	}
+	if obj["file_path"] != "/tmp/f.txt" {
+		t.Fatalf("file_path missing or wrong: %s", args)
+	}
+	if _, ok := obj["path"]; ok {
+		t.Fatalf("path key leaked to DSH read: %s", args)
+	}
+}
+
+// A client that declares the canonical argument schema (native OpenCode)
+// already speaks path/oldString; translating it would corrupt the call.
+func TestFilterPassesCanonicalArgsForCanonicalSchema(t *testing.T) {
+	f := newChatToolCallFilterWithSchemas([]string{"read", "edit"}, map[string]json.RawMessage{
+		"read": json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`),
+		"edit": json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}}}`),
+	})
+	readLine := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"/tmp/f.txt\"}"}}]},"finish_reason":null}]}`
+	name, args := firstFilteredCall(t, applyFilter(t, f, readLine))
+	if name != "read" || args != `{"path":"/tmp/f.txt"}` {
+		t.Fatalf("canonical read was rewritten: %s %s", name, args)
+	}
+	editLine := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","type":"function","function":{"name":"edit","arguments":"{\"path\":\"/tmp/f.txt\",\"oldString\":\"a\",\"newString\":\"b\",\"replaceAll\":true}"}}]},"finish_reason":null}]}`
+	name, args = firstFilteredCall(t, applyFilter(t, f, editLine))
+	if name != "edit" || args != `{"path":"/tmp/f.txt","oldString":"a","newString":"b","replaceAll":true}` {
+		t.Fatalf("canonical edit was rewritten: %s %s", name, args)
+	}
+}
+
+// DSH's websearch takes a queries array, not a single query string.
+func TestFilterTranslatesWebsearchArgumentsForDSH(t *testing.T) {
+	f := newChatToolCallFilter([]string{"web_search"})
+	line := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"websearch","arguments":"{\"query\":\"golang json\"}"}}]},"finish_reason":null}]}`
+
+	out := applyFilter(t, f, line)
+	name, args := firstFilteredCall(t, out)
+
+	if name != "web_search" {
+		t.Fatalf("expected web_search, got %q: %s", name, out)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(args), &obj); err != nil {
+		t.Fatalf("translated args are not JSON: %v\n%s", err, args)
+	}
+	queries, ok := obj["queries"].([]any)
+	if !ok || len(queries) != 1 || queries[0] != "golang json" {
+		t.Fatalf("queries array missing or wrong: %s", args)
+	}
+	if _, ok := obj["query"]; ok {
+		t.Fatalf("query key leaked to DSH websearch: %s", args)
+	}
+}
+
+// Arguments that arrive in several SSE fragments must be buffered and emitted
+// as one translated call, not relayed fragment by fragment.
+func TestFilterConsolidatesSplitArguments(t *testing.T) {
+	f := newChatToolCallFilter([]string{"bash"})
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]}`
+	second := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]},"finish_reason":null}]}`
+	third := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pwd\"}"}}]},"finish_reason":null}]}`
+
+	applyFilter(t, f, first)
+	applyFilter(t, f, second)
+	out := applyFilter(t, f, third)
+	name, args := firstFilteredCall(t, out)
+
+	if name != "bash" {
+		t.Fatalf("expected bash, got %q: %s", name, out)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(args), &obj); err != nil {
+		t.Fatalf("consolidated args are not JSON: %v\n%s", err, args)
+	}
+	if obj["description"] == nil || obj["command"] != "pwd" {
+		t.Fatalf("split args not translated: %s", args)
+	}
+}
+
+// If the stream ends before the buffered arguments form valid JSON, the call
+// must still be emitted. A silent drop here becomes an empty stop turn and
+// stalls the agent loop.
+func TestFilterFlushesIncompleteCallAtFinish(t *testing.T) {
+	f := newChatToolCallFilter([]string{"bash"})
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"shell","arguments":"{\"command\":"}}]},"finish_reason":null}]}`
+	finish := `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+
+	applyFilter(t, f, first)
+	out := applyFilter(t, f, finish)
+
+	name, _ := firstFilteredCall(t, out)
+	if name != "bash" {
+		t.Fatalf("incomplete buffered call was dropped: %s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("finish_reason should be tool_calls after flush: %s", out)
+	}
+}
+
+// A call resolved from a single complete fragment must still be remembered for
+// history restore; only the split-fragment path used to record it.
+func TestFilterRemembersSingleFragmentTranslatedCall(t *testing.T) {
+	const callID = "call_single_fragment_remember"
+	f := newChatToolCallFilter([]string{"bash"})
+	line := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"` + callID + `","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]},"finish_reason":null}]}`
+	name, _ := firstFilteredCall(t, applyFilter(t, f, line))
+	if name != "bash" {
+		t.Fatalf("resolved name = %q, want bash", name)
+	}
+	canonicalName, canonicalArgs, ok := proxy.RestoreTranslatedCall(callID, "bash", `{"command":"pwd","description":"Run a shell command"}`)
+	if !ok || canonicalName != "shell" || canonicalArgs != `{"command":"pwd"}` {
+		t.Fatalf("call not remembered: name=%q args=%q ok=%v", canonicalName, canonicalArgs, ok)
+	}
+}
+
+// A canonical skill call is renamed and its `id` key translated. Its arguments
+// arrive in fragments, so the canonical args must be remembered only once the
+// full JSON is available, and the client must receive one consolidated call.
+func TestFilterTranslatesAndRemembersSplitSkillCall(t *testing.T) {
+	const callID = "call_skill_split"
+	f := newChatToolCallFilter([]string{"Skill"})
+
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"` + callID + `","type":"function","function":{"name":"skill","arguments":"{\"id\":"}}]},"finish_reason":null}]}`
+	out := applyFilter(t, f, first)
+	if strings.Contains(out, callID) {
+		t.Fatalf("incomplete call was emitted before its arguments were valid: %s", out)
+	}
+
+	second := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"load_skill\"}"}}]},"finish_reason":null}]}`
+	name, args := firstFilteredCall(t, applyFilter(t, f, second))
+	if name != "Skill" {
+		t.Fatalf("resolved name = %q, want Skill", name)
+	}
+	if args != `{"skill":"load_skill"}` {
+		t.Fatalf("translated args = %s, want the client schema shape", args)
+	}
+
+	canonicalName, canonicalArgs, ok := proxy.RestoreTranslatedCall(callID, "Skill", `{"skill":"load_skill"}`)
+	if !ok || canonicalName != "skill" || canonicalArgs != `{"id":"load_skill"}` {
+		t.Fatalf("remembered call = %q %q (ok=%v), want skill with full canonical args",
+			canonicalName, canonicalArgs, ok)
+	}
+}
+
+// A renamed call with no argument translation still buffers split arguments so
+// history restore never records a truncated JSON object.
+func TestFilterRemembersFullArgsForRenamedSplitCall(t *testing.T) {
+	const callID = "call_renamed_split"
+	f := newChatToolCallFilter([]string{"ImageGenerate"})
+
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"` + callID + `","type":"function","function":{"name":"experimental_image_generate","arguments":"{\"prompt\":"}}]},"finish_reason":null}]}`
+	if out := applyFilter(t, f, first); strings.Contains(out, callID) {
+		t.Fatalf("incomplete call was emitted: %s", out)
+	}
+	second := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a cat\"}"}}]},"finish_reason":null}]}`
+	name, args := firstFilteredCall(t, applyFilter(t, f, second))
+	if name != "ImageGenerate" || args != `{"prompt":"a cat"}` {
+		t.Fatalf("emitted call = %q %s", name, args)
+	}
+	canonicalName, canonicalArgs, ok := proxy.RestoreTranslatedCall(callID, "ImageGenerate", `{"prompt":"a cat"}`)
+	if !ok || canonicalName != "experimental_image_generate" || canonicalArgs != `{"prompt":"a cat"}` {
+		t.Fatalf("remembered call = %q %q (ok=%v)", canonicalName, canonicalArgs, ok)
+	}
+}
+
+// OpenAI streams a tool call's name as a string that may be split across
+// chunks. The filter must rebuild it before resolving a shell fallback;
+// resolving only the first fragment turned `read` into an unresolvable `re`
+// and dropped a call the client could have run.
+func TestFilterRebuildsSplitToolName(t *testing.T) {
+	f := newChatToolCallFilter([]string{"Bash"})
+
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_split","type":"function","function":{"name":"re","arguments":"{\"pa"}}]},"finish_reason":null}]}`
+	if out := applyFilter(t, f, first); strings.Contains(out, "call_split") {
+		t.Fatalf("split call was emitted before its name and args completed: %s", out)
+	}
+	second := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"ad","arguments":"th\":\"/tmp/a.txt\"}"}}]},"finish_reason":null}]}`
+	name, args := firstFilteredCall(t, applyFilter(t, f, second))
+	if name != "Bash" {
+		t.Fatalf("resolved name = %q, want Bash", name)
+	}
+	if !strings.Contains(args, "/tmp/a.txt") {
+		t.Fatalf("fallback args lost the path: %s", args)
+	}
+}
+
+// A fragment with no name must not reach the client before the filter knows
+// whether the call survives. Relaying it left a nameless tool call on the wire
+// even when the later name was undeclared and dropped.
+func TestFilterBuffersNamelessFragment(t *testing.T) {
+	f := newChatToolCallFilter([]string{"Bash"})
+
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_noname","type":"function","function":{"arguments":"{}"}}]},"finish_reason":null}]}`
+	if out := applyFilter(t, f, first); strings.Contains(out, "call_noname") || strings.Contains(out, `"function"`) {
+		t.Fatalf("nameless fragment leaked to the client: %s", out)
+	}
+	second := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"frobnicate","arguments":""}}]},"finish_reason":null}]}`
+	if out := applyFilter(t, f, second); strings.Contains(out, "frobnicate") {
+		t.Fatalf("dropped call leaked: %s", out)
+	}
+	finish := `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`
+	out := applyFilter(t, f, finish)
+	if !strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("finish reason still advertises a dropped tool call: %s", out)
+	}
 }

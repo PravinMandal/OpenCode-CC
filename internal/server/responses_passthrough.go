@@ -47,6 +47,10 @@ func (s *Server) proxyResponsesPassthrough(
 	}
 	upstreamStream := in.Stream
 	if proxy.IsFreeModel(targetModel) {
+		// This lane posts to /v1/responses, which the Bun sidecar does not
+		// carry (it proxies Chat Completions only). The free-tier marker tools
+		// are therefore still required here even when the sidecar is ready;
+		// skipping them would send a bare Responses request to the gate.
 		upBody, err = proxy.PrepareFreeResponsesBody(upBody)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",

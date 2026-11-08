@@ -73,6 +73,9 @@ func (s *Server) proxyAnthropicViaResponses(
 	}
 	upstreamStream := areq.Stream
 	if proxy.IsFreeModel(targetModel) {
+		// Responses-native models are posted to /v1/responses, which the Bun
+		// sidecar does not carry. Keep the free-tier marker tools regardless
+		// of sidecar readiness.
 		upBody, err = proxy.PrepareFreeResponsesBody(upBody)
 		if err != nil {
 			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
@@ -727,9 +730,43 @@ func isForcedToolChoice(areq *proxy.AnthropicRequest) bool {
 
 // Limit continuation to short, unfinished action introductions. A full answer
 // with tools available is not by itself evidence that a call was omitted.
+// Free-tier GLM rarely ends the trailer with a colon: it writes "Call 2 of the
+// run — second pwd probe..." or a planning paragraph ending "Let me proceed.
+// df -h." and stops. Both are the same stall: the model announced the next
+// action and ended the turn without emitting it. Completion markers keep a
+// legitimate short final answer from being extended.
 func isToolCallStall(text string) bool {
-	text = strings.TrimSpace(text)
-	return len(text) > 0 && len(text) < 400 && strings.HasSuffix(text, ":")
+	original := strings.TrimSpace(text)
+	if len(original) == 0 {
+		return false
+	}
+	// A long single paragraph ending in a colon is not the flake shape; the
+	// observed stall is short. Keep the historical bound for the colon test.
+	if strings.HasSuffix(original, ":") && len(original) < 400 {
+		return true
+	}
+	text = original
+	if len(text) > 400 {
+		text = strings.TrimSpace(text[len(text)-400:])
+	}
+	lower := strings.ToLower(text)
+	for _, done := range []string{
+		"completed", "finished", "all done", "summary", "result.json",
+		"deliverables", "verified", "pass", "fail", "blocked",
+	} {
+		if strings.Contains(lower, done) {
+			return false
+		}
+	}
+	for _, cue := range []string{
+		"call ", "step ", "next", "let me", "i'll", "i will", "proceed",
+		"continue", "now run", "then run", "next run", "df -h", "pwd",
+	} {
+		if strings.Contains(lower, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 func anthropicResponseText(resp *proxy.AnthropicResponse) string {

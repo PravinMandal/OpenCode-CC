@@ -5,19 +5,17 @@ replaces the separate DS Flash helper service and the fixed `:18790` listener.
 
 ## Why a Bun hop exists at all
 
-Zen's free tier is gated on the TLS/HTTP2 stack, not only on the request body.
-Measured on 2026-11-01 with an identical body, headers, key and session:
+Zen's free tier gates requests on client identity, not only on the request body.
+Measured on 2026-11-08 with an identical body, key and headers: a request
+carrying an established session id returned `200`, while the same request with
+a fresh id returned `429 FreeUsageLimitError`. The free tier leases quota to a
+session id. The earlier 2026-11-01 measurement (Bun `200`; Go, Node, Python and
+curl `429`) was consistent with this: each non-Bun replay used a fresh id, so
+it was denied regardless of its TLS stack.
 
-| Client | Result |
-|---|---|
-| Bun (`fetch`, HTTP/2) | `200` |
-| Go `net/http` | `429 FreeUsageLimitError` |
-| Node `fetch` | `429` |
-| Python `requests` | `429` |
-| `curl` | `429` |
-
-A byte-for-byte replay that Bun completes successfully is rejected from Go, so
-the transport cannot be ported into the Go proxy. `opencode-cc` therefore keeps
+A byte-for-byte replay that Bun completes successfully is rejected from Go when
+it carries a fresh id, so the transport cannot be ported into the Go proxy
+without also reproducing the session lease. `opencode-cc` therefore keeps
 exactly one Bun hop and hides it: it starts the process itself on an ephemeral
 loopback port, passes it an admission token, restarts it on exit, and stops it
 on shutdown. There is no fixed port and no second service to manage.
@@ -43,6 +41,56 @@ Local LFM3 ──────────────┘                        
   free model goes to the sidecar, everything else uses the hardened Go
   transport.
 
+## Session lease and durability
+
+The free tier leases quota to the session id, not to the API key, organization
+or egress address. A newly generated id is answered with
+`FreeUsageLimitError` even while an established id on the same key and IP
+returns `200`. The sidecar therefore:
+
+1. derives one scope from the **live credential fingerprint** and the client
+   session headers. The inbound `Authorization` is deleted by the Go leg before
+   the sidecar sees the request, so the credential fingerprint (not that
+   header) is what separates accounts; a credential/account rotation starts a
+   new lease lane instead of pinning the old account's id;
+2. persists `scope -> {id, at, goodAt, cred}` and a small pool of recently
+   accepted ids in `~/.local/share/opencode-native/sessions.json` (durable
+   write + fsync, atomic rename, `0600`, capped at 512 scopes) so a service
+   restart reuses the lease instead of losing it — the original incident was a
+   restart that forgot every id;
+3. keeps the id for 24 hours of inactivity by default, refreshing the mapping
+   at most every five minutes;
+4. keeps up to 16 accepted ids in the lease pool for 24 hours. When a fresh id
+   has no lease (typically after the daily free window closes), the sidecar
+   tries pool candidates **least-recently-good first**, up to three per
+   request, so new conversations do not all converge on one id and exhaust it
+   while the others still have quota. Only when the pool is exhausted does it
+   invoke the reset engine; after a successful reset it retries the current id
+   once, then mints one fresh id and retries once more. A rejected id is
+   removed from the pool and its scope mapping is expired, so it cannot be
+   handed back;
+5. records a failed request shape after reset + fresh-id retry still returns
+   `FreeUsageLimitError`, and skips further radio resets for that shape for
+   ten minutes (`x-oc-reset: shape`). The free tier returns the same generic
+   error for unknown clients and oversized tool surfaces, so without this a
+   shape that can never pass would cycle the phone once per turn.
+
+`BRIDGE_SESSION_ID` pins one id for smoke tests or recovery. It must match the
+stock shape `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` and must not be the all-hex
+spoof shape Zen rejects; anything else is logged as
+`session_override_rejected` and not sent upstream. `BRIDGE_SESSION_STORE`
+overrides the file path.
+
+A fresh install has no leased id and cannot create one until the free window
+reopens; `BRIDGE_SESSION_ID` can seed a known-leased id for a smoke test. Do
+not delete `sessions.json` during a restart: the file is the lease record, not
+a cache. A corrupt store is logged (`session_store_load_failed`) and treated as
+empty rather than silently replaced.
+
+The upstream chat API is stateless and the body carries the whole conversation,
+so the id is an affinity/quota handle only, not a server-side conversation key.
+This is an observed property of the free lane, not a documented guarantee.
+
 ## Free-model detection
 
 `internal/proxy.IsFreeModel` is intentionally generic:
@@ -65,18 +113,32 @@ Zen also gates the free lane on the tool set. Measured on 2026-11-02:
 
 The sidecar therefore:
 
-1. replaces the client's tool list with the captured canonical 13 tools;
-2. suppresses client-only tools and logs `tools_suppressed` once per distinct
+1. replaces the client's tool list with the captured canonical tools;
+2. removes every canonical tool the client cannot run at all — not just a
+   trailing suffix, because a dead tool in the middle stays callable while a
+   note claims it is unavailable (today: Code Mode's `execute` for T3's
+   Claude Code lane, which declares no execution tool) — and logs
+   `tools_unavailable_pruned`; the captured prompt still describes the pruned
+   tools, so a system note right after it says they are unavailable. Without
+   this, the model calls `execute`, the Go layer has no declared target, and
+   the turn ends with a dropped-call notice. The remaining canonical tools
+   keep the free-tier gate's accepted shape;
+3. suppresses client-only tools and logs `tools_suppressed` once per distinct
    tool-name set;
-3. keeps the client's tools executable by translating the canonical call back
+4. keeps the client's tools executable by translating the canonical call back
    to the declared tool name and argument keys (`shell`→`Bash`, `read`→`Read`,
    `skill`→`Skill`, `path`→`file_path`, …);
-4. falls back to `Bash` + `rg` when the client does not declare `Grep`/`Glob`;
-5. emits a visible text notice when a call cannot be resolved, instead of
+5. falls back to `Bash` + `rg` when the client does not declare `Grep`/`Glob`;
+6. emits a visible text notice when a call cannot be resolved, instead of
    ending the turn silently.
 
 `BRIDGE_CLIENT_TOOL_EXTRAS=1` appends client tools for deliberate experiments,
 but that shape is known to be rejected by the free tier and is not the default.
+
+`BRIDGE_KEEP_DEAD_TOOLS=1` disables the dead-tool prune and sends the full
+captured list; the system note still names the tools the client cannot run, so
+the model is told not to call them. Use it only if the free-tier shape gate
+starts rejecting the shorter canonical list.
 
 The captured system prompt embeds the capture date, so the sidecar substitutes
 today's date at request time; otherwise an identity captured yesterday would be
@@ -126,23 +188,57 @@ All knobs are optional environment variables read by the sidecar:
 | `BRIDGE_CLIENT_TOOL_PRIORITY` | `ToolSearch,DeferredToolPlaceholder,ReportFindings,ScheduleWakeup,Workflow,ListAgents` | extras preference order |
 | `BRIDGE_MAX_TOOL_CHARS` | `38000` | hard character cap for the tool surface |
 | `BRIDGE_MIN_START_GAP_MS` | `400` | spacing between request starts |
-| `BRIDGE_HEADER_TIMEOUT_MS` | `240000` | upstream header deadline |
+| `BRIDGE_HEADER_TIMEOUT_MS` | `240000` | first-attempt upstream header deadline |
+| `BRIDGE_TRANSPORT_RETRY_BUDGET_MS` | `30000` | extra budget shared by transport retries (a header timeout is never retried) |
+| `BRIDGE_MAX_AGGREGATE_BYTES` | `16777216` | cap for a buffered non-stream response |
 | `BRIDGE_MAX_INFLIGHT` | `8` | concurrent requests |
 | `BRIDGE_TRACE_DIR` | unset | dump normalized request bodies for diagnosis |
+| `BRIDGE_RESET_SCRIPT` | `~/.config/opencode/scripts/request-reset.mjs` | shared egress reset engine |
+| `BRIDGE_RESET_SOURCE` | `opencode-cc` | reset-engine source name |
+| `BRIDGE_RESET_COOLDOWN_MS` | `60000` | minimum gap between automatic resets |
+| `BRIDGE_RESET_TIMEOUT_MS` | `600000` | hard limit for one reset-engine run |
+| `BRIDGE_RESET_SHARED_WAIT_MS` | `660000` | wait for a foreign reset lock (above the 600s stale threshold) |
+| `BRIDGE_RESET_LOCK_STALE_MS` | `600000` | age at which a live-but-hung reset lock is reclaimed |
+| `BRIDGE_SESSION_TTL_MS` | `86400000` | inactivity before a session id (and its lease) is rotated |
+| `BRIDGE_SESSION_STORE` | `~/.local/share/opencode-native/sessions.json` | durable session-id store |
+| `BRIDGE_SESSION_ID` | unset | pin one upstream session id (smoke tests, recovery) |
+| `BRIDGE_LEASE_POOL_TTL_MS` | `86400000` | age after which an accepted id leaves the fallback pool |
+| `BRIDGE_LEASE_POOL_LIMIT` | `16` | maximum accepted ids kept in the fallback pool |
+| `BRIDGE_LEASE_FALLBACK_ATTEMPTS` | `3` | pool ids tried before a reset |
+| `BRIDGE_SHAPE_FAILURE_TTL_MS` | `600000` | how long an unpassable request shape skips radio resets |
+| `BRIDGE_CAPTURE_MODEL_TIMEOUT_MS` | derived | per-model identity capture timeout |
+| `BRIDGE_RESET_STATE` / `BRIDGE_RESET_LOCK` | the engine defaults | override only for tests |
+| `BRIDGE_NODE` | `node` | interpreter for the reset engine |
 | `OPENCODE_CC_BUN` | autodetect | Bun executable |
 
 ### Quota handling
 
-A 429 is returned to the caller as-is. The sidecar does **not** probe the
-budget, retry with a different shape, or rotate the egress. Automatic rotation
-is forbidden by policy: an operator may run a reset by hand, but the proxy and
-its watcher must never do it on their own.
+A non-quota 429 is returned to the caller as-is. A free-tier
+`FreeUsageLimitError` is evaluated against the request's session lease: an
+established id can be allowed while a fresh id on the same key, org and IP is
+denied. The sidecar walks the lease ladder described above (pool → reset →
+fresh id), then calls the shared reset engine
+(`request-reset.mjs --source=opencode-cc`, `RESET_ALLOW_AUTOMATIC=1`) at most
+once, joins a reset already in flight or waits out a foreign lock. The reset
+path remains for a genuinely exhausted IP; it is not a substitute for session
+reuse. The sidecar surfaces a 429 only when the reset failed, the retry is
+still limited, or the request shape is marked unpassable.
 
 The sidecar adds diagnostic headers to a 429:
 
 - `x-oc-native: 1`
-- `x-oc-reset: manual`
-- `retry-after` passed through from the provider when present
+- `x-oc-reset: manual` (non-quota 429), `failed` (reset failed/backoff/disabled),
+  `retried` (reset succeeded but the retry is still limited), or `shape`
+  (reset + fresh-id retry still limited; resets are skipped for this shape)
+- `x-oc-reset-source: opencode-cc`
+- `retry-after` is deliberately **not** forwarded: the upstream value can be
+  hours long and would lock local clients out. `x-oc-reset` describes the local
+  recovery state instead.
+
+`/health` reports `quota.automaticRecovery: true`, the reset source, cooldown,
+and `lease.pool`, `lease.lastGoodAgeMs`, `lease.fallbackAttempts` for diagnosis.
+The engine still owns the radio, the lock, the cooldown and the reset state; the
+sidecar only asks it to act.
 
 ## Migration from the fixed-port helper
 

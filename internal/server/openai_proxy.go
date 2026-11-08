@@ -60,23 +60,52 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		}
 
 		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
-		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+		newUpReq := func(body []byte) (*http.Request, error) {
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", "Bearer "+zenKey)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("User-Agent", ocUA())
+			setZenSessionHeaders(req, r.Header, cacheKey)
+			if upstreamStream {
+				req.Header.Set("Accept", "text/event-stream")
+			} else {
+				req.Header.Set("Accept", "application/json")
+			}
+			return req, nil
+		}
+		upReq, err := newUpReq(upBody)
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
 				"could not build upstream request: "+err.Error())
 			return
 		}
-		upReq.Header.Set("Authorization", "Bearer "+zenKey)
-		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("User-Agent", ocUA())
-		setZenSessionHeaders(upReq, r.Header, cacheKey)
-		if upstreamStream {
-			upReq.Header.Set("Accept", "text/event-stream")
-		} else {
-			upReq.Header.Set("Accept", "application/json")
-		}
 
 		httpClient := s.upstreamClient(upstreamStream, cfg.RequestTimeoutSeconds)
+		// The empty-completion guard re-posts the same body when the free tier
+		// answers 200 with no content and no tool call (reasoning-only turns).
+		var resample func([]byte) (*http.Response, error)
+		if cfg.BridgeToollessResample {
+			resample = func(body []byte) (*http.Response, error) {
+				// Rescue bodies are raw client requests (the original or a
+				// nudged variant). Apply the same preparation as the first hop:
+				// history restore, model resolution, prompt cache and the free
+				// lane shape. Posting the raw body re-sent the unresolved alias
+				// and skipped PrepareFreeChatBody, so the rescue failed exactly
+				// on the free tier it exists for.
+				prepared, _, _, _, err := s.prepareOpenAIRequest(body)
+				if err != nil {
+					return nil, err
+				}
+				req, err := newUpReq(prepared)
+				if err != nil {
+					return nil, err
+				}
+				return doUpstreamWithRetry(httpClient, req, prepared)
+			}
+		}
 		// Retry a stalled/5xx upstream once before failing. Zen free-tier
 		// intermittently stalls awaiting response headers (>30s) and 503s
 		// under concurrency; without this the client sees a hard 502
@@ -95,7 +124,7 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		if upstreamStream && resp.StatusCode < http.StatusBadRequest &&
 			(contentType == "" || strings.Contains(contentType, "text/event-stream")) {
 			if clientStream {
-				s.relayOpenAIStream(w, resp, r, incomingModel, targetModel, body, start)
+				s.relayOpenAIStream(w, resp, r, incomingModel, targetModel, body, start, resample)
 			} else {
 				s.relayOpenAIAggregated(w, resp, r, incomingModel, targetModel, body, start)
 			}
@@ -108,6 +137,9 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 // prepareOpenAIRequest validates the JSON object and rewrites only its model
 // field, preserving extensions used by different OpenAI-compatible clients.
 func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool, error) {
+	// Replayed history carries the client-facing tool names and argument keys.
+	// Restore the canonical calls the model actually made before forwarding.
+	body = proxy.RestoreChatHistory(body)
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, "", "", false, fmt.Errorf("request body is not valid OpenAI JSON: %w", err)
@@ -145,9 +177,16 @@ func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool
 		return nil, "", "", false, fmt.Errorf("could not encode upstream request: %w", err)
 	}
 	if proxy.IsFreeModel(targetModel) {
-		upBody, err = proxy.PrepareFreeChatBody(upBody)
-		if err != nil {
-			return nil, "", "", false, fmt.Errorf("could not prepare Zen free-tier request: %w", err)
+		// When the Bun sidecar is ready it supplies the canonical tool set and
+		// forces streaming itself. Injecting the free-tier marker tools here
+		// would make the sidecar believe the client declared shell/read, so a
+		// zero-tool client would keep tools it cannot run. The markers are only
+		// needed on the direct (no-sidecar) fallback path.
+		if !s.nativeTransportReady() {
+			upBody, err = proxy.PrepareFreeChatBody(upBody)
+			if err != nil {
+				return nil, "", "", false, fmt.Errorf("could not prepare Zen free-tier request: %w", err)
+			}
 		}
 		// Zen's free lane only accepts the official streaming/tool shape. The
 		// handler still uses the original body to decide how to answer a
@@ -169,32 +208,37 @@ func filterUndeclaredOpenAITools(out *proxy.OpenAIResponse, reqBody []byte) {
 	if out == nil {
 		return
 	}
-	var request struct {
-		Tools []struct {
-			Function struct {
-				Name string `json:"name"`
-			} `json:"function"`
-		} `json:"tools"`
-	}
-	if json.Unmarshal(reqBody, &request) != nil {
-		return
-	}
-	declared := make(map[string]struct{}, len(request.Tools))
-	for _, tool := range request.Tools {
-		if tool.Function.Name != "" {
-			declared[tool.Function.Name] = struct{}{}
+	declared := declaredOpenAIToolNames(reqBody)
+	schemas := declaredOpenAIToolSchemas(reqBody)
+	for ci := range out.Choices {
+		msg := out.Choices[ci].Message
+		if msg == nil || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		kept := msg.ToolCalls[:0]
+		for _, call := range msg.ToolCalls {
+			resolved, translated, ok := proxy.ResolveDeclaredCallWithSchemas(
+				call.Function.Name, call.Function.Arguments, declared, schemas)
+			if !ok {
+				continue
+			}
+			if resolved != call.Function.Name || translated != call.Function.Arguments {
+				proxy.RememberTranslatedCall(call.ID, call.Function.Name, call.Function.Arguments, resolved, translated)
+				call.Function.Name = resolved
+				call.Function.Arguments = translated
+			}
+			kept = append(kept, call)
+		}
+		msg.ToolCalls = kept
+		// A choice that lost every call must not advertise tool_calls as the
+		// finish reason: OpenAI SDKs treat that as "there are calls to run"
+		// and wait forever for tool results that will never arrive.
+		if len(kept) == 0 && out.Choices[ci].FinishReason != nil &&
+			*out.Choices[ci].FinishReason == "tool_calls" {
+			stop := "stop"
+			out.Choices[ci].FinishReason = &stop
 		}
 	}
-	if len(out.Choices) == 0 || out.Choices[0].Message == nil {
-		return
-	}
-	calls := out.Choices[0].Message.ToolCalls[:0]
-	for _, call := range out.Choices[0].Message.ToolCalls {
-		if _, ok := declared[call.Function.Name]; ok {
-			calls = append(calls, call)
-		}
-	}
-	out.Choices[0].Message.ToolCalls = calls
 }
 
 // relayOpenAIAggregated adapts a forced upstream SSE response to the
@@ -319,6 +363,7 @@ func (s *Server) relayOpenAIStream(
 	incomingModel, targetModel string,
 	reqBody []byte,
 	start time.Time,
+	resample func([]byte) (*http.Response, error),
 ) {
 	defer resp.Body.Close()
 
@@ -360,7 +405,8 @@ func (s *Server) relayOpenAIStream(
 		flusher:  flusher,
 		log:      &responseLog,
 		logLimit: s.cfg.Snapshot().MaxBodyLogBytes,
-		filter:   newChatToolCallFilter(declaredOpenAIToolNames(reqBody)),
+		filter:   newChatToolCallFilterWithSchemas(declaredOpenAIToolNames(reqBody), declaredOpenAIToolSchemas(reqBody)),
+		hold:     true,
 	}
 	if _, err := io.Copy(relay, reader); err != nil {
 		errPayload, _ := json.Marshal(map[string]any{
@@ -377,6 +423,25 @@ func (s *Server) relayOpenAIStream(
 	}
 	_ = relay.Flush()
 
+	if !relay.hasVisible && !relay.wroteAny && resp.StatusCode == http.StatusOK {
+		// A 200 stream with no text and no tool call is not a usable
+		// completion; the free tier answers reasoning-only turns this way.
+		// Text is never held: the first visible delta is streamed through, so
+		// a normal answer keeps its token-by-token latency. A narrated stall
+		// can no longer be retracted once streamed, so it is not rescued here.
+		rescued := s.rescueEmptyOpenAIStream(w, flusher, reqBody, relay.logLimit,
+			resample, incomingModel, targetModel)
+		if rescued != nil {
+			relay = rescued
+		} else if relay.held.Len() > 0 {
+			// Nothing rescued: release the original stream so the client still
+			// receives a well-formed completion.
+			_, _ = w.Write(relay.held.Bytes())
+			relay.held.Reset()
+			flusher.Flush()
+		}
+	}
+
 	if summary := relay.filter.summary(); summary != "" {
 		log.Printf("opencode-cc: chat stream tool filter %s model=%s target=%s",
 			summary, incomingModel, targetModel)
@@ -384,7 +449,170 @@ func (s *Server) relayOpenAIStream(
 
 	s.logSuccessWithCache(r.Context(), r, incomingModel, targetModel, true, resp.StatusCode,
 		relay.inputTokens, relay.outputTokens, relay.cachedInputTokens, 0, relay.stopReason,
-		string(reqBody), responseLog.String(), time.Since(start))
+		string(reqBody), relay.log.String(), time.Since(start))
+}
+
+// rescueEmptyOpenAIStream replaces an empty 200 chat completion with one
+// retry. It buffers the candidate response fully before touching the client:
+// a retry that turns out empty or errors midway must not append a second
+// message to the open SSE response.
+func (s *Server) rescueEmptyOpenAIStream(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	reqBody []byte,
+	logLimit int,
+	resample func([]byte) (*http.Response, error),
+	incomingModel, targetModel string,
+) *openAIStreamRelay {
+	if resample == nil {
+		return nil
+	}
+	attempts := []struct {
+		name string
+		body []byte
+	}{{"same", reqBody}}
+	if nudged, ok := appendOpenAIContinueNudge(reqBody); ok {
+		if forced, ok := forceOpenAIToolChoice(nudged); ok {
+			nudged = forced
+		}
+		attempts = append(attempts, struct {
+			name string
+			body []byte
+		}{"nudge", nudged})
+	}
+	for _, attempt := range attempts {
+		resp, err := resample(attempt.body)
+		if err != nil {
+			log.Printf("opencode-cc: empty chat stream retry failed attempt=%s err=%v model=%s target=%s",
+				attempt.name, err, incomingModel, targetModel)
+			continue
+		}
+		if resp == nil {
+			continue
+		}
+		if resp.StatusCode >= http.StatusBadRequest {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+			_ = resp.Body.Close()
+			log.Printf("opencode-cc: empty chat stream retry status=%d attempt=%s model=%s target=%s",
+				resp.StatusCode, attempt.name, incomingModel, targetModel)
+			continue
+		}
+		reader := io.Reader(resp.Body)
+		var gz *gzip.Reader
+		if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+			gz, err = gzip.NewReader(resp.Body)
+			if err != nil {
+				_ = resp.Body.Close()
+				continue
+			}
+			reader = gz
+		}
+		var buf bytes.Buffer
+		candidate := &openAIStreamRelay{
+			dst:      &buf,
+			flusher:  noopStreamFlusher{},
+			log:      &strings.Builder{},
+			logLimit: logLimit,
+			filter:   newChatToolCallFilterWithSchemas(declaredOpenAIToolNames(attempt.body), declaredOpenAIToolSchemas(attempt.body)),
+			hold:     true,
+		}
+		n, cerr := io.Copy(candidate, io.LimitReader(reader, maxResponseBytes+1))
+		_ = candidate.Flush()
+		if gz != nil {
+			_ = gz.Close()
+		}
+		_ = resp.Body.Close()
+		if cerr != nil || n > maxResponseBytes {
+			log.Printf("opencode-cc: empty chat stream retry unreadable attempt=%s err=%v model=%s target=%s",
+				attempt.name, cerr, incomingModel, targetModel)
+			continue
+		}
+		if !candidate.hasVisible {
+			log.Printf("opencode-cc: empty chat stream retry still empty attempt=%s out=%d model=%s target=%s",
+				attempt.name, candidate.outputTokens, incomingModel, targetModel)
+			continue
+		}
+		// The candidate held its leading frames (role/empty delta) because
+		// nothing was visible yet; once text arrives the relay writes later
+		// frames straight to buf. Prepend the held prefix so the rescued
+		// stream is complete, not a fragment starting at the first text delta.
+		if candidate.held.Len() > 0 {
+			var combined bytes.Buffer
+			combined.Write(candidate.held.Bytes())
+			combined.Write(buf.Bytes())
+			candidate.held.Reset()
+			buf = combined
+		}
+		if _, err := w.Write(buf.Bytes()); err != nil {
+			return nil
+		}
+		flusher.Flush()
+		log.Printf("opencode-cc: empty chat stream rescued attempt=%s out=%d model=%s target=%s",
+			attempt.name, candidate.outputTokens, incomingModel, targetModel)
+		return candidate
+	}
+	return nil
+}
+
+type noopStreamFlusher struct{}
+
+func (noopStreamFlusher) Flush() {}
+
+// forceOpenAIToolChoice turns an OpenAI Chat body into a forced tool call when
+// it declares tools. Used only by rescue retries: the model has already
+// narrated the next action and ended its turn, so a second text-only sample is
+// useless. Bodies without tools are left unchanged.
+func forceOpenAIToolChoice(body []byte) ([]byte, bool) {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return nil, false
+	}
+	var tools []json.RawMessage
+	if raw, ok := payload["tools"]; !ok || json.Unmarshal(raw, &tools) != nil || len(tools) == 0 {
+		return nil, false
+	}
+	payload["tool_choice"] = json.RawMessage(`"required"`)
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// appendOpenAIContinueNudge appends one user turn asking for the next action.
+// Used only after an identical retry of an empty completion is also empty.
+func appendOpenAIContinueNudge(body []byte) ([]byte, bool) {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return nil, false
+	}
+	var messages []json.RawMessage
+	if raw, ok := payload["messages"]; ok {
+		if json.Unmarshal(raw, &messages) != nil {
+			return nil, false
+		}
+	}
+	if len(messages) == 0 {
+		return nil, false
+	}
+	nudge, err := json.Marshal(map[string]any{
+		"role":    "user",
+		"content": "Continue with the next action now. Do not reply with an empty message.",
+	})
+	if err != nil {
+		return nil, false
+	}
+	messages = append(messages, nudge)
+	raw, err := json.Marshal(messages)
+	if err != nil {
+		return nil, false
+	}
+	payload["messages"] = raw
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // openAIStreamRelay writes upstream bytes to the client and flushes every
@@ -403,7 +631,26 @@ type openAIStreamRelay struct {
 	outputTokens      int
 	cachedInputTokens int
 	stopReason        string
+
+	// hold keeps the response off the wire until the first visible delta
+	// (text or tool call). A 200 stream with no visible output is the free
+	// tier's reasoning-only stop; holding lets the server replace it with a
+	// rescued sample instead of handing the client an empty completion.
+	hold        bool
+	held        bytes.Buffer
+	hasVisible  bool
+	hasToolCall bool
+	// wroteAny records that at least one byte reached the client. Once that
+	// happens a rescue sample cannot be substituted (it would append a
+	// second completion after [DONE]); the reasoning-only turn is passed
+	// through instead.
+	wroteAny bool
 }
+
+// heldStreamLimit bounds the reasoning-only prefix buffered before a visible
+// delta. A text answer releases on its first delta, so this only caps a
+// pathological reasoning stream.
+const heldStreamLimit = 1 << 20
 
 func (r *openAIStreamRelay) Write(p []byte) (int, error) {
 	r.pending = append(r.pending, p...)
@@ -458,15 +705,46 @@ func (r *openAIStreamRelay) emitLine(line []byte) error {
 		}
 	}
 
+	r.observe(out)
+
+	// Hold only until the first visible delta. A reasoning-only 200 stream
+	// needs to be buffered so it can be replaced by a rescued sample, but a
+	// text answer must stream token by token: holding it until a tool call
+	// would turn every text response into a full-response buffer.
+	if r.hold && !r.hasVisible {
+		r.held.Write(out)
+		r.held.Write(trailer)
+		appendLimited(r.log, string(out), r.logLimit)
+		appendLimited(r.log, string(trailer), r.logLimit)
+		// Bound the buffer: a stream that emits only reasoning must not grow
+		// without limit while we wait for a visible delta.
+		if r.held.Len() > heldStreamLimit {
+			r.hold = false
+			if _, err := r.dst.Write(r.held.Bytes()); err != nil {
+				return err
+			}
+			r.wroteAny = true
+			r.held.Reset()
+			r.flusher.Flush()
+		}
+		return nil
+	}
+	if r.hold && r.held.Len() > 0 {
+		if _, err := r.dst.Write(r.held.Bytes()); err != nil {
+			return err
+		}
+		r.wroteAny = true
+		r.held.Reset()
+	}
 	if _, err := r.dst.Write(out); err != nil {
 		return err
 	}
 	if _, err := r.dst.Write(trailer); err != nil {
 		return err
 	}
+	r.wroteAny = true
 	appendLimited(r.log, string(out), r.logLimit)
 	appendLimited(r.log, string(trailer), r.logLimit)
-	r.observe(body)
 	r.flusher.Flush()
 	return nil
 }
@@ -522,6 +800,16 @@ func (r *openAIStreamRelay) observe(line []byte) {
 	for _, choice := range chunk.Choices {
 		if choice.FinishReason != nil {
 			r.stopReason = *choice.FinishReason
+		}
+		// Reasoning alone is invisible to OpenAI chat clients: T3's DSH
+		// adapter treats it as "completed response with no content". Only
+		// text or a tool call makes a sample usable.
+		if choice.Delta.Content != "" {
+			r.hasVisible = true
+		}
+		if len(choice.Delta.ToolCalls) > 0 || choice.Delta.FunctionCall != nil {
+			r.hasVisible = true
+			r.hasToolCall = true
 		}
 	}
 }

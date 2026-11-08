@@ -6,20 +6,20 @@ package proxy
 
 // AnthropicRequest is the body of POST /v1/messages.
 type AnthropicRequest struct {
-	Model       string              `json:"model"`
-	Messages    []AnthropicMessage  `json:"messages"`
-	System      AnthropicSystem     `json:"system,omitempty"`
-	MaxTokens   int                 `json:"max_tokens"`
-	Temperature *float64            `json:"temperature,omitempty"`
-	TopP        *float64            `json:"top_p,omitempty"`
-	TopK        *int                `json:"top_k,omitempty"`
-	Stop        []string            `json:"stop_sequences,omitempty"`
-	Stream      bool                `json:"stream,omitempty"`
-	Tools       []AnthropicTool     `json:"tools,omitempty"`
-	ToolChoice  AnthropicToolChoice `json:"tool_choice,omitempty"`
-	Thinking    *AnthropicThinking  `json:"thinking,omitempty"`
+	Model        string                 `json:"model"`
+	Messages     []AnthropicMessage     `json:"messages"`
+	System       AnthropicSystem        `json:"system,omitempty"`
+	MaxTokens    int                    `json:"max_tokens"`
+	Temperature  *float64               `json:"temperature,omitempty"`
+	TopP         *float64               `json:"top_p,omitempty"`
+	TopK         *int                   `json:"top_k,omitempty"`
+	Stop         []string               `json:"stop_sequences,omitempty"`
+	Stream       bool                   `json:"stream,omitempty"`
+	Tools        []AnthropicTool        `json:"tools,omitempty"`
+	ToolChoice   AnthropicToolChoice    `json:"tool_choice,omitempty"`
+	Thinking     *AnthropicThinking     `json:"thinking,omitempty"`
 	OutputConfig *AnthropicOutputConfig `json:"output_config,omitempty"`
-	Metadata    jsonRawMessage      `json:"metadata,omitempty"`
+	Metadata     jsonRawMessage         `json:"metadata,omitempty"`
 	// Other rarely-used fields are ignored.
 }
 
@@ -28,34 +28,34 @@ type AnthropicRequest struct {
 // would otherwise send tool_choice: {"type":""} to native upstreams.
 func (r AnthropicRequest) MarshalJSON() ([]byte, error) {
 	type request struct {
-		Model       string               `json:"model"`
-		Messages    []AnthropicMessage   `json:"messages"`
-		System      *AnthropicSystem     `json:"system,omitempty"`
-		MaxTokens   int                  `json:"max_tokens"`
-		Temperature *float64             `json:"temperature,omitempty"`
-		TopP        *float64             `json:"top_p,omitempty"`
-		TopK        *int                 `json:"top_k,omitempty"`
-		Stop        []string             `json:"stop_sequences,omitempty"`
-		Stream      bool                 `json:"stream,omitempty"`
-		Tools       []AnthropicTool      `json:"tools,omitempty"`
-		ToolChoice  *AnthropicToolChoice `json:"tool_choice,omitempty"`
-		Thinking    *AnthropicThinking   `json:"thinking,omitempty"`
+		Model        string                 `json:"model"`
+		Messages     []AnthropicMessage     `json:"messages"`
+		System       *AnthropicSystem       `json:"system,omitempty"`
+		MaxTokens    int                    `json:"max_tokens"`
+		Temperature  *float64               `json:"temperature,omitempty"`
+		TopP         *float64               `json:"top_p,omitempty"`
+		TopK         *int                   `json:"top_k,omitempty"`
+		Stop         []string               `json:"stop_sequences,omitempty"`
+		Stream       bool                   `json:"stream,omitempty"`
+		Tools        []AnthropicTool        `json:"tools,omitempty"`
+		ToolChoice   *AnthropicToolChoice   `json:"tool_choice,omitempty"`
+		Thinking     *AnthropicThinking     `json:"thinking,omitempty"`
 		OutputConfig *AnthropicOutputConfig `json:"output_config,omitempty"`
-		Metadata    jsonRawMessage       `json:"metadata,omitempty"`
+		Metadata     jsonRawMessage         `json:"metadata,omitempty"`
 	}
 	out := request{
-		Model:       r.Model,
-		Messages:    r.Messages,
-		MaxTokens:   r.MaxTokens,
-		Temperature: r.Temperature,
-		TopP:        r.TopP,
-		TopK:        r.TopK,
-		Stop:        r.Stop,
-		Stream:      r.Stream,
-		Tools:       r.Tools,
-		Thinking:    r.Thinking,
+		Model:        r.Model,
+		Messages:     r.Messages,
+		MaxTokens:    r.MaxTokens,
+		Temperature:  r.Temperature,
+		TopP:         r.TopP,
+		TopK:         r.TopK,
+		Stop:         r.Stop,
+		Stream:       r.Stream,
+		Tools:        r.Tools,
+		Thinking:     r.Thinking,
 		OutputConfig: r.OutputConfig,
-		Metadata:    r.Metadata,
+		Metadata:     r.Metadata,
 	}
 	if len(r.System.Blocks) > 0 {
 		out.System = &r.System

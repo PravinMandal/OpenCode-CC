@@ -788,3 +788,54 @@ func TestPromptCacheKeyUsesAnthropicCacheControlBoundary(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// The Anthropic lane must rebuild a split streamed tool name too. The Chat
+// filter and Responses converter already do; before this test `bufferTool`
+// kept only the first fragment, so a shell-only client saw `she` dropped even
+// though it could run the call as Bash.
+func TestStreamConversionRebuildsSplitToolName(t *testing.T) {
+	var out bytes.Buffer
+	conv, err := NewStreamConverter(&out, "test-model", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.RestrictTools([]string{"Bash"})
+
+	first := &OpenAIStreamChunk{Choices: []OpenAIChoice{{
+		Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+			Index: 0, ID: "call_split",
+			Function: OpenAIFunctionCall{Name: "she", Arguments: ""},
+		}}},
+	}}}
+	if err := conv.HandleChunk(first); err != nil {
+		t.Fatal(err)
+	}
+	finish := "tool_calls"
+	second := &OpenAIStreamChunk{Choices: []OpenAIChoice{{
+		Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+			Index:    0,
+			Function: OpenAIFunctionCall{Name: "ll", Arguments: `{"command":"pwd"}`},
+		}}},
+		FinishReason: &finish,
+	}}}
+	if err := conv.HandleChunk(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Finalize("end_turn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, `"name":"Bash"`) {
+		t.Fatalf("split name was not rebuilt and resolved:\n%s", got)
+	}
+	if strings.Contains(got, "Dropped tool call") {
+		t.Fatalf("split name was dropped:\n%s", got)
+	}
+	if !strings.Contains(got, `"stop_reason":"tool_use"`) {
+		t.Fatalf("stop reason was not tool_use:\n%s", got)
+	}
+}

@@ -651,3 +651,166 @@ func TestResponsesStreamConverterReasoningContent(t *testing.T) {
 		t.Fatalf("reasoning should be emitted before text:\n%s", out)
 	}
 }
+
+// A restricted call that cannot resolve must be dropped before any event: no
+// output_item.added, no argument deltas, no done item, and nothing in the final
+// response. Emitting added first and dropping later leaves the client holding a
+// phantom item.
+func TestResponsesStreamRestrictedDropsCallBeforeAdded(t *testing.T) {
+	var stream strings.Builder
+	converter, err := NewResponsesStreamConverter(&stream, "client-model")
+	if err != nil {
+		t.Fatalf("new converter: %v", err)
+	}
+	converter.RestrictTools([]string{"Read"})
+	finish := "tool_calls"
+	if err := converter.HandleChunk(&OpenAIStreamChunk{
+		Choices: []OpenAIChoice{{
+			Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+				Index: 0, ID: "call_1",
+				Function: OpenAIFunctionCall{Name: "write", Arguments: `{"path":"/tmp/x","content":"y"}`},
+			}}},
+			FinishReason: &finish,
+		}},
+	}); err != nil {
+		t.Fatalf("tool chunk: %v", err)
+	}
+	if err := converter.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	out := stream.String()
+	for _, forbidden := range []string{
+		"response.output_item.added",
+		"response.function_call_arguments.delta",
+		"response.output_item.done",
+		`"type":"function_call"`,
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("dropped call leaked %q:\n%s", forbidden, out)
+		}
+	}
+	if !strings.Contains(out, "response.completed") {
+		t.Fatalf("stream did not complete:\n%s", out)
+	}
+}
+
+// A resolvable call emits added exactly once and its done item carries the
+// translated name and the full argument object.
+func TestResponsesStreamRestrictedAddedDoneParity(t *testing.T) {
+	var stream strings.Builder
+	converter, err := NewResponsesStreamConverter(&stream, "client-model")
+	if err != nil {
+		t.Fatalf("new converter: %v", err)
+	}
+	converter.RestrictToolsWithSchemas([]string{"read"}, map[string]json.RawMessage{
+		"read": json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`),
+	})
+	finish := "tool_calls"
+	for _, chunk := range []OpenAIStreamChunk{
+		{Choices: []OpenAIChoice{{Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+			Index: 0, ID: "call_1",
+			Function: OpenAIFunctionCall{Name: "read", Arguments: `{"path":`},
+		}}}}}},
+		{Choices: []OpenAIChoice{{
+			Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+				Index:    0,
+				Function: OpenAIFunctionCall{Arguments: `"/tmp/f.txt"}`},
+			}}},
+			FinishReason: &finish,
+		}}},
+	} {
+		if err := converter.HandleChunk(&chunk); err != nil {
+			t.Fatalf("chunk: %v", err)
+		}
+	}
+	if err := converter.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	out := stream.String()
+	if got := strings.Count(out, "event: response.output_item.added"); got != 1 {
+		t.Fatalf("output_item.added count = %d, want 1:\n%s", got, out)
+	}
+	if !strings.Contains(out, `"arguments":"{\"path\":\"/tmp/f.txt\"}"`) {
+		t.Fatalf("canonical args were rewritten:\n%s", out)
+	}
+	if !strings.Contains(out, `"name":"read"`) {
+		t.Fatalf("added/done item missing name:\n%s", out)
+	}
+	if !strings.Contains(out, "event: response.output_item.done") {
+		t.Fatalf("missing output_item.done:\n%s", out)
+	}
+}
+
+// An empty, non-nil declared list means the client declared no tools: every
+// function call is phantom and must be dropped.
+func TestResponsesStreamNoDeclaredToolsDropsCalls(t *testing.T) {
+	var stream strings.Builder
+	converter, err := NewResponsesStreamConverter(&stream, "client-model")
+	if err != nil {
+		t.Fatalf("new converter: %v", err)
+	}
+	converter.RestrictTools([]string{})
+	finish := "tool_calls"
+	if err := converter.HandleChunk(&OpenAIStreamChunk{
+		Choices: []OpenAIChoice{{
+			Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+				Index: 0, ID: "call_1",
+				Function: OpenAIFunctionCall{Name: "read", Arguments: `{"path":"/tmp/x"}`},
+			}}},
+			FinishReason: &finish,
+		}},
+	}); err != nil {
+		t.Fatalf("tool chunk: %v", err)
+	}
+	if err := converter.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	out := stream.String()
+	for _, forbidden := range []string{"response.output_item.added", `"type":"function_call"`} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("phantom call leaked %q:\n%s", forbidden, out)
+		}
+	}
+}
+
+// A restricted call's name is a streamed string too. Resolving only the first
+// fragment (`re`) dropped a call the shell-only client could run as `read`.
+func TestResponsesStreamRestrictedRebuildsSplitName(t *testing.T) {
+	var stream strings.Builder
+	converter, err := NewResponsesStreamConverter(&stream, "client-model")
+	if err != nil {
+		t.Fatalf("new converter: %v", err)
+	}
+	converter.RestrictTools([]string{"Bash"})
+	finish := "tool_calls"
+	for _, chunk := range []OpenAIStreamChunk{
+		{Choices: []OpenAIChoice{{Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+			Index: 0, ID: "call_split",
+			Function: OpenAIFunctionCall{Name: "re", Arguments: `{"path":`},
+		}}}}}},
+		{Choices: []OpenAIChoice{{
+			Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+				Index:    0,
+				Function: OpenAIFunctionCall{Name: "ad", Arguments: `"/tmp/f.txt"}`},
+			}}},
+			FinishReason: &finish,
+		}}},
+	} {
+		if err := converter.HandleChunk(&chunk); err != nil {
+			t.Fatalf("chunk: %v", err)
+		}
+	}
+	if err := converter.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	out := stream.String()
+	if !strings.Contains(out, `"name":"Bash"`) {
+		t.Fatalf("split name was not rebuilt and resolved:\n%s", out)
+	}
+	if !strings.Contains(out, "/tmp/f.txt") {
+		t.Fatalf("fallback command lost the path:\n%s", out)
+	}
+	if got := strings.Count(out, "event: response.output_item.added"); got != 1 {
+		t.Fatalf("output_item.added count = %d, want 1:\n%s", got, out)
+	}
+}
