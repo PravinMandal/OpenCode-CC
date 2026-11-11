@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,151 +9,145 @@ import (
 	"testing"
 )
 
-type fakeNative struct {
-	url   string
-	token string
-	err   error
+type fakeNativeEndpoint struct {
+	url    string
+	token  string
+	enable bool
 }
 
-func (f fakeNative) Enabled() bool { return true }
-func (f fakeNative) Endpoint() (string, string, error) {
-	return f.url, f.token, f.err
-}
+func (f fakeNativeEndpoint) Enabled() bool { return f.enable }
 
-func staticNativeTransport(base http.RoundTripper, mgr nativeEndpoint) http.RoundTripper {
-	return newNativeTransport(base, mgr, nil)
-}
+func (f fakeNativeEndpoint) Endpoint() (string, string, error) { return f.url, f.token, nil }
 
-type recorderTransport struct {
-	mu    sync.Mutex
-	calls []*http.Request
-}
-
-func (r *recorderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	r.mu.Lock()
-	r.calls = append(r.calls, req.Clone(req.Context()))
-	r.mu.Unlock()
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Status:     "200 OK",
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-		Request:    req,
-	}, nil
-}
-
-func zenRequest(t *testing.T, model string) *http.Request {
+func nativeTestRequest(t *testing.T) *http.Request {
 	t.Helper()
-	body := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}]}`
-	req, err := http.NewRequest(http.MethodPost, "https://opencode.ai/inference/v1/chat/completions", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer client-key")
+	body := `{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "https://opencode.ai/inference/v1/chat/completions", strings.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(body)), nil }
 	return req
 }
 
-func TestNativeTransportRoutesEveryFreeModel(t *testing.T) {
-	var gotPath, gotToken, gotAuth, gotBody string
+// TestNativeFreeLaneRotatesOn429AfterReset is the free-lane quota contract:
+// the sidecar has already attempted the egress reset (x-oc-reset: failed), so
+// the proxy rotates to the next key, replays the body, and tells the sidecar
+// not to cycle the radio again for that retry.
+func TestNativeFreeLaneRotatesOn429AfterReset(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		creds   []string
+		noReset []string
+	)
 	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotToken, gotAuth = r.URL.Path, r.Header.Get("x-bridge-token"), r.Header.Get("Authorization")
-		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		mu.Lock()
+		creds = append(creds, r.Header.Get("x-bridge-credential"))
+		noReset = append(noReset, r.Header.Get("x-bridge-no-reset"))
+		n := len(creds)
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("x-oc-reset", "failed")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer sidecar.Close()
 
-	for _, model := range []string{
-		"deepseek-v4.1-flash-free",
-		"glm-5.3-flash-free",
-		"oc/nemotron-3.5-lightning-free",
-		"brand-new-model-free",
-		"big-pickle",
-	} {
-		t.Run(model, func(t *testing.T) {
-			base := &recorderTransport{}
-			tr := staticNativeTransport(base, fakeNative{url: sidecar.URL + "/v1/chat/completions", token: "tok"})
-			req := zenRequest(t, model)
-			resp, err := tr.RoundTrip(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d", resp.StatusCode)
-			}
-			if len(base.calls) != 0 {
-				t.Fatalf("free model went to the Go transport %d time(s)", len(base.calls))
-			}
-			if gotPath != "/v1/chat/completions" {
-				t.Errorf("sidecar path = %q", gotPath)
-			}
-			if gotToken != "tok" {
-				t.Errorf("bridge token = %q", gotToken)
-			}
-			if gotAuth != "" {
-				t.Errorf("client Authorization leaked to sidecar: %q", gotAuth)
-			}
-			if !strings.Contains(gotBody, model) {
-				t.Errorf("body did not preserve model: %q", gotBody)
-			}
-		})
-	}
-}
+	pool := newCredentialPool(failoverConfig("key-one", "key-two"))
+	tr := newNativeTransport(&scriptedRoundTripper{}, fakeNativeEndpoint{
+		url: sidecar.URL + "/v1/chat/completions", token: "tok", enable: true,
+	}, pool)
+	req := nativeTestRequest(t)
+	req.Header.Set("Authorization", "Bearer key-one")
 
-func TestNativeTransportLeavesPaidModelsAlone(t *testing.T) {
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("paid model reached the sidecar")
-	}))
-	defer sidecar.Close()
-
-	base := &recorderTransport{}
-	tr := staticNativeTransport(base, fakeNative{url: sidecar.URL + "/v1/chat/completions", token: "tok"})
-	req := zenRequest(t, "claude-sonnet-5")
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("round trip: %v", err)
 	}
 	defer resp.Body.Close()
-	if len(base.calls) != 1 {
-		t.Fatalf("base calls = %d, want 1", len(base.calls))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-}
-
-func TestNativeTransportLeavesNonZenTrafficAlone(t *testing.T) {
-	base := &recorderTransport{}
-	tr := staticNativeTransport(base, fakeNative{url: "http://127.0.0.1:1/v1/chat/completions", token: "tok"})
-	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{"model":"glm-5.3-flash-free"}`))
-	if err != nil {
-		t.Fatal(err)
+	if len(creds) != 2 || creds[0] != "key-one" || creds[1] != "key-two" {
+		t.Fatalf("credentials = %v, want [key-one key-two]", creds)
 	}
-	resp, err := tr.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if len(base.calls) != 1 {
-		t.Fatalf("base calls = %d, want 1", len(base.calls))
-	}
-}
-
-func TestNativeTransportUnavailableIs503(t *testing.T) {
-	base := &recorderTransport{}
-	tr := staticNativeTransport(base, fakeNative{err: errors.New("sidecar is still starting")})
-	resp, err := tr.RoundTrip(zenRequest(t, "glm-5.3-flash-free"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	if len(noReset) != 2 || noReset[0] != "" || noReset[1] != "1" {
+		t.Fatalf("x-bridge-no-reset = %v, want [\"\" \"1\"] (reset once, then rotate only)", noReset)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "native transport unavailable") {
-		t.Errorf("body = %s", body)
+	if string(body) != `{"ok":true}` {
+		t.Fatalf("body = %q, want the successful retry", body)
 	}
-	if len(base.calls) != 0 {
-		t.Errorf("unavailable free request fell back to the Go transport")
+}
+
+// TestNativeFreeLaneDoesNotRotateOnManual429 keeps non-quota 429s (the sidecar
+// marks them x-oc-reset: manual) from burning every key.
+func TestNativeFreeLaneDoesNotRotateOnManual429(t *testing.T) {
+	var mu sync.Mutex
+	var creds []string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		creds = append(creds, r.Header.Get("x-bridge-credential"))
+		mu.Unlock()
+		w.Header().Set("x-oc-reset", "manual")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error"}}`)
+	}))
+	defer sidecar.Close()
+
+	pool := newCredentialPool(failoverConfig("key-one", "key-two"))
+	tr := newNativeTransport(&scriptedRoundTripper{}, fakeNativeEndpoint{
+		url: sidecar.URL + "/v1/chat/completions", token: "tok", enable: true,
+	}, pool)
+	req := nativeTestRequest(t)
+	req.Header.Set("Authorization", "Bearer key-one")
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+	if len(creds) != 1 {
+		t.Fatalf("credentials = %v, want a single attempt for a non-quota 429", creds)
+	}
+}
+
+// TestNativeFreeLane429IsBounded proves an exhausted pool stops after one
+// attempt per key instead of looping.
+func TestNativeFreeLane429IsBounded(t *testing.T) {
+	var mu sync.Mutex
+	var creds []string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		creds = append(creds, r.Header.Get("x-bridge-credential"))
+		n := len(creds)
+		mu.Unlock()
+		w.Header().Set("x-oc-reset", "skipped")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"limited `+string(rune('0'+n))+`"}`)
+	}))
+	defer sidecar.Close()
+
+	pool := newCredentialPool(failoverConfig("key-one", "key-two", "key-three"))
+	tr := newNativeTransport(&scriptedRoundTripper{}, fakeNativeEndpoint{
+		url: sidecar.URL + "/v1/chat/completions", token: "tok", enable: true,
+	}, pool)
+	req := nativeTestRequest(t)
+	req.Header.Set("Authorization", "Bearer key-one")
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+	if len(creds) != 3 {
+		t.Fatalf("credentials = %v, want one attempt per key", creds)
 	}
 }

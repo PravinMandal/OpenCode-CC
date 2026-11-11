@@ -104,6 +104,28 @@
 - `opencode://active` in a saved upstream's `api_key` opts into reading that
   current credential for each request. OpenCode owns OAuth refresh; never copy
   or reuse its rotating refresh token or modify its credential database.
+- Prefer `env:NAME` or `file:/absolute/path` references over literal keys in
+  `config.json`; both fail closed when the variable/file is empty or missing.
+- Several `upstreams` entries with the **same** `base_url` form a key pool.
+  Keys may belong to one employer account or to several accounts that the same
+  employer issued; a pool must never mix unrelated third-party accounts.
+  Requests round-robin over the entries. A `401`/`403` that looks
+  credential-related, including a workspace denial, marks that key dead for
+  five minutes and replays the request with the next key; a quota/billing 403
+  is surfaced instead. A `429` marks the key *limited* for 60 seconds and
+  rotates as the **last resort**, after the free-tier sidecar has attempted its
+  egress reset for that request (`x-bridge-no-reset` stops later keys from
+  cycling the radio again). Failover is bounded by the pool size and always
+  returns the real upstream error.
+- A key from a different account must not inherit the captured account's
+  workspace header or session lease. The sidecar learns the mismatch from the
+  first `403 Workspace access denied`, drops `x-opencode-org-id` /
+  `x-opencode-workspace-id` for that credential, moves it to a key-scoped
+  lease lane, and retries once. This is automatic and needs no per-account
+  configuration.
+- The free-tier sidecar receives the selected key on the authenticated loopback
+  leg (`x-bridge-credential`). It must never read a client key from the public
+  request; the Go layer strips the inbound Authorization before that hop.
 - WARP runs as a local SOCKS proxy on `127.0.0.1:40000`. The relay uses explicit
   `HTTP_PROXY`/`HTTPS_PROXY` settings; other apps remain direct. WARP proxy mode
   in this installed release requires MASQUE. Use `warp-cli status` and a

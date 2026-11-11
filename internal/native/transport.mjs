@@ -94,6 +94,29 @@ const PRUNE_TOOL_RESULTS = process.env.BRIDGE_PRUNE_TOOL_RESULTS !== "0";
 const PRUNE_KEEP_RESULTS = Math.max(2, Number(process.env.BRIDGE_PRUNE_KEEP_RESULTS || 8) || 8);
 const PRUNE_PREVIEW_CHARS = Math.max(200, Number(process.env.BRIDGE_PRUNE_PREVIEW_CHARS || 600) || 600);
 const PRUNE_MARKER = "\n\n[opencode-cc: older tool output pruned to fit the free-tier window. Re-run the tool if you need the full result.]";
+// Routed models disagree about the prompt-cache field. DeepSeek and GLM accept
+// `prompt_cache_options`; some smaller models reject the whole request with
+// 400 unsupported_parameter. Remember which model rejected it so later turns
+// send the shape that model accepts instead of paying a failed round trip.
+const cacheOptionsRejected = new Set();
+
+function stripPromptCacheFields(body, model) {
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return null; }
+  let changed = false;
+  for (const key of ["prompt_cache_options", "prompt_cache_retention", "prompt_cache_key"]) {
+    if (key in parsed) {
+      delete parsed[key];
+      changed = true;
+    }
+  }
+  if (!changed) return null;
+  // Store the canonical name: the request builder checks cacheOptionsRejected
+  // with cleanModelName(...), so storing the raw alias would never match and
+  // every turn would pay the same 400 repair again.
+  if (model) cacheOptionsRejected.add(cleanModelName(model));
+  return JSON.stringify(parsed);
+}
 
 function toolContentSize(content) {
   if (typeof content === "string") return content.length;
@@ -216,6 +239,13 @@ function accountScope() {
   return org ? "account:" + org : "";
 }
 
+// A credential from a different account must not inherit this account's
+// workspace header or session lease. Zen answers with "Workspace access
+// denied" when the org in the header does not own the bearer key. The set is
+// learned on the first 403 and remembered for the process lifetime, so a pool
+// holding keys from several accounts works without any account configuration.
+const foreignCredentials = new Set();
+
 function inboundCredential(inbound) {
   return String(headerValue(inbound, "x-bridge-credential") || "").trim();
 }
@@ -233,6 +263,8 @@ function identityReady() {
 // org header yet, fall back to the key fingerprint for a stable bootstrap
 // scope. Once the capture is loaded, key rotation no longer resets leases.
 function leaseAccount(override = "") {
+  const fp = override ? credentialFingerprint(false, override) : "";
+  if (fp && foreignCredentials.has(fp)) return "cred:" + fp;
   return accountScope() || ("cred:" + credentialFingerprint(false, override));
 }
 
@@ -619,11 +651,15 @@ function nextLeaseCandidate(exclude) {
   return candidates[0] || null;
 }
 
-function leaseShapeKey(meta) {
+function leaseShapeKey(meta, credentialOverride = "") {
   const shape = meta?.shape || {};
   const reset = readResetState();
   return sha(JSON.stringify({
-    credential: leaseAccount(),
+    credential: leaseAccount(credentialOverride),
+    // A shape failure describes the remaining budget of one key, not the
+    // account. Without the key in the signature a key rotated in after a 429
+    // inherits the exhausted key's cached result and is never attempted.
+    key: credentialFingerprint(false, credentialOverride),
     resetAt: Number(reset.lastSuccessAt || 0),
     egress4: String(reset.lastIp4 || ""),
     egress6: String(reset.lastIp || ""),
@@ -889,6 +925,13 @@ function upstreamHeaders(modelName, sessionId, credentialOverride = "") {
     "x-session-id": sessionId,
     ...traceIds(),
   });
+  if (credentialOverride) {
+    const fp = credentialFingerprint(false, credentialOverride);
+    if (foreignCredentials.has(fp)) {
+      headers.delete("x-opencode-org-id");
+      headers.delete("x-opencode-workspace-id");
+    }
+  }
   const key = liveCredential(false, credentialOverride);
   if (key) headers.set("authorization", `Bearer ${key}`);
   return headers;
@@ -1071,7 +1114,9 @@ function normalize(raw) {
   // to the stock client's shape before anything leaves this process.
   if (parsed.prompt_cache_retention !== undefined) {
     delete parsed.prompt_cache_retention;
-    if (!parsed.prompt_cache_options) parsed.prompt_cache_options = { mode: "implicit" };
+    if (!parsed.prompt_cache_options && !cacheOptionsRejected.has(modelClean)) {
+      parsed.prompt_cache_options = { mode: "implicit" };
+    }
   }
 
   // Canonical tools only, by default. Their names are part of the cached
@@ -1251,6 +1296,17 @@ const json = (body, status = 200, headers = undefined) => {
   if (status >= 500) out.set("x-oc-native", "1");
   return Response.json(body, { status, headers: out });
 };
+
+// relayText rebuilds a response whose body was already read and decoded by
+// fetch. Content-Encoding/Content-Length describe the wire bytes, not this
+// decoded string, so forwarding them would make the caller decode twice or
+// wait for bytes that no longer exist.
+function relayText(text, response) {
+  const headers = new Headers(response.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  return new Response(text, { status: response.status, headers });
+}
 
 // Pull one complete JSON object out of the stream tail. The usage object nests
 // prompt_tokens_details, so a `[^}]*` match truncates it into unparseable text.
@@ -1617,6 +1673,7 @@ async function upstream(body, inbound, meta, lease) {
   let leaseFallbacks = 0;
   let postResetGrace = false;
   let accountRecaptureDone = false;
+  let cacheRepairDone = false;
   let last429 = null;
   let sessionId = lease.id;
   const totalDeadline = Number(meta.started || Date.now()) + HEADER_TIMEOUT + TRANSPORT_RETRY_BUDGET_MS;
@@ -1665,6 +1722,24 @@ async function upstream(body, inbound, meta, lease) {
     // Only an SSE body can be rebuilt into a completion. An upstream error
     // body (400/500 JSON) must pass through with its real status, or the
     // caller loses the provider's message behind a fake "truncated stream".
+    // A pooled key can belong to a different employer account than the one
+    // whose request shape was captured. The bearer key alone selects the
+    // workspace; this account's org header and leased session are what trigger
+    // "Workspace access denied". Learn the key as foreign, drop those headers,
+    // move it to its own lease lane, and retry once.
+    if (response.status === 403 && credentialOverride) {
+      const fp = credentialFingerprint(false, credentialOverride);
+      const text403 = await response.text();
+      if (/workspace|access denied|wrong workspace/i.test(text403)) {
+        if (!foreignCredentials.has(fp)) {
+          foreignCredentials.add(fp);
+          sessionId = leaseFor(inbound, credentialOverride).id;
+          log({ event: "credential_account_mismatch", ...meta, attempt, body: text403.slice(0, 200) });
+          continue;
+        }
+      }
+      return relayText(text403, response);
+    }
     // Account mismatch is the one identity failure recovery can repair: the
     // active account changed while the bridge kept running. Recapture once and
     // retry, instead of polling the credential on every request.
@@ -1677,7 +1752,23 @@ async function upstream(body, inbound, meta, lease) {
         postResetGrace = true;
         continue;
       }
-      return new Response(text, { status: response.status, headers: new Headers(response.headers) });
+      return relayText(text, response);
+    }
+    // A model that rejects the prompt-cache field answers 400 before any
+    // generation. Repair the shape once and replay: this is a capability
+    // difference, not a bad request from the client.
+    if (response.status === 400 && !cacheRepairDone) {
+      const text = await response.text();
+      const repaired = /prompt_cache_(options|retention|key)/i.test(text)
+        ? stripPromptCacheFields(body, meta?.model)
+        : null;
+      if (repaired) {
+        cacheRepairDone = true;
+        body = repaired;
+        log({ event: "cache_options_unsupported", ...meta, attempt, body: text.slice(0, 200) });
+        continue;
+      }
+      return relayText(text, response);
     }
     if (response.status !== 429) {
       if (response.ok) markGoodSession(lease.scope, sessionId);
@@ -1705,7 +1796,7 @@ async function upstream(body, inbound, meta, lease) {
     // The generic error cannot distinguish quota from request shape. Scope a
     // cached failure to the active account and last successful egress reset so
     // an account switch or a new IP does not inherit another lane's failure.
-    const shapeKey = leaseShapeKey(meta);
+    const shapeKey = leaseShapeKey(meta, credentialOverride);
     const blockedAt = shapeFailureAt(shapeKey);
     if (blockedAt) {
       log({ event: "quota_reset_skipped_shape", ...meta, attempt, ageMs: Date.now() - blockedAt });
@@ -1725,6 +1816,15 @@ async function upstream(body, inbound, meta, lease) {
         sessionId = next.id;
         continue;
       }
+    }
+
+    // 1b. Go is rotating API keys for this request, so the egress has already
+    // been reset (or deliberately skipped) for this attempt. Cycling the radio
+    // once per key would leave the phone offline for minutes and still return
+    // 429s. Surface now and let the caller try the next key.
+    if (headerValue(inbound, "x-bridge-no-reset") === "1") {
+      log({ event: "quota_reset_skipped_failover", ...meta, attempt });
+      return passThrough429(response, text, "skipped");
     }
 
     // 2. Rotate the egress once. The reset engine can legitimately run for

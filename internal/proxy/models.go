@@ -3,10 +3,13 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
 )
+
+var errNoUpstream = errors.New("no upstream configured")
 
 // AnthropicModelInfo describes one entry in the model list.
 type AnthropicModelInfo struct {
@@ -88,58 +91,114 @@ func ModelsHandler(client *http.Client, upstreamBase, apiKey func() string) http
 // ModelsHandlerWithUpstream is like ModelsHandler but obtains the upstream base
 // URL and API key as one pair. Use this when the caller selects from a rotating
 // upstream pool, so the base URL and key cannot drift apart between callbacks.
+//
+// The cache is single-flight: Claude Code fans out many subagents, and without
+// it a cold or failing upstream turns every concurrent /v1/models call into its
+// own fetch. A failed fetch also backs off for modelsErrorBackoff so an
+// upstream outage cannot pin the process in a request storm. Stale-but-known
+// models are always preferred over an error or a made-up list.
 func ModelsHandlerWithUpstream(client *http.Client, upstream func() (base, apiKey string)) http.HandlerFunc {
+	const modelsErrorBackoff = 20 * time.Second
+
 	var (
-		mu       sync.RWMutex
+		mu       sync.Mutex
 		cache    []AnthropicModelInfo
 		cachedAt time.Time
+		failedAt time.Time
+		inflight chan struct{}
 	)
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Serve a snapshot from cache if fresh (< 60s). The cache is read by
-		// every concurrent client (Claude Code fans out subagents), so the
-		// slice header must not be mutated while another goroutine reads it.
-		mu.RLock()
-		cached := cache
-		at := cachedAt
-		mu.RUnlock()
-		if len(cached) > 0 && time.Since(at) < time.Minute {
-			list := AnthropicModelList{Data: cached, Object: "list", HasMore: false}
-			writeJSON(w, http.StatusOK, list)
+		write := func(list []AnthropicModelInfo) {
+			if len(list) == 0 {
+				list = fallbackModels()
+			}
+			writeJSON(w, http.StatusOK, AnthropicModelList{Data: list, Object: "list", HasMore: false})
+		}
+		snapshot := func() []AnthropicModelInfo {
+			out := make([]AnthropicModelInfo, len(cache))
+			copy(out, cache)
+			return out
+		}
+
+		mu.Lock()
+		fresh := len(cache) > 0 && time.Since(cachedAt) < time.Minute
+		backoff := !failedAt.IsZero() && time.Since(failedAt) < modelsErrorBackoff
+		if fresh || backoff {
+			list := snapshot()
+			mu.Unlock()
+			write(list)
 			return
 		}
-		// Fetch live from upstream with a hard timeout so a stalled
-		// upstream can never park this handler (and every later caller,
-		// once the 60s cache expires) forever.
-		base, key := upstream()
-		if base != "" && client != nil {
-			fetchCtx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-			models, err := fetchZenModels(fetchCtx, client, base, key)
-			cancel()
-			if err == nil && len(models) > 0 {
-				mu.Lock()
-				cache = models
-				cachedAt = time.Now()
-				mu.Unlock()
-			}
-		}
-		mu.RLock()
-		list := cache
-		mu.RUnlock()
-		if len(list) == 0 {
-			// Minimal fallback so the endpoint never errors.
-			list = []AnthropicModelInfo{{
-				ID: "glm-5.1", Type: "model", Object: "model", OwnedBy: "opencode-zen",
-			}}
-			mu.Lock()
-			if len(cache) == 0 {
-				cache = list
-			}
+		if inflight != nil {
+			wait := inflight
 			mu.Unlock()
+			select {
+			case <-wait:
+			case <-r.Context().Done():
+			}
+			mu.Lock()
+			list := snapshot()
+			mu.Unlock()
+			write(list)
+			return
 		}
-		writeJSON(w, http.StatusOK, AnthropicModelList{
-			Data: list, Object: "list", HasMore: false,
+		inflight = make(chan struct{})
+		done := inflight
+		mu.Unlock()
+
+		// Use a background timeout rather than r.Context(): one canceled
+		// caller must not abort the fetch every other caller is waiting on.
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		base, key := upstream()
+		var (
+			models []AnthropicModelInfo
+			err    error
+		)
+		if base != "" && client != nil {
+			models, err = fetchZenModels(fetchCtx, client, base, key)
+		} else {
+			err = errNoUpstream
+		}
+		cancel()
+
+		mu.Lock()
+		if err == nil && len(models) > 0 {
+			cache = models
+			cachedAt = time.Now()
+			failedAt = time.Time{}
+		} else {
+			failedAt = time.Now()
+		}
+		list := snapshot()
+		inflight = nil
+		close(done)
+		mu.Unlock()
+		write(list)
+	}
+}
+
+// fallbackModels is only used when no successful catalog fetch has ever
+// happened. It mirrors the current public Zen free set so a cold start with a
+// briefly unavailable catalog still gives clients real, usable ids.
+func fallbackModels() []AnthropicModelInfo {
+	ids := []string{
+		"deepseek-v4.1-flash-free",
+		"glm-5.3-flash-free",
+		"mimo-v2.6-flash-free",
+		"nemotron-3.5-lightning-free",
+		"nemotron-3.5-super-vl-free",
+		"beam-free",
+		"flint-40b-free",
+		"big-pickle",
+		"minimax-m3.1-flash-free",
+	}
+	out := make([]AnthropicModelInfo, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, AnthropicModelInfo{
+			ID: id, Type: "model", Object: "model", OwnedBy: "opencode-zen",
 		})
 	}
+	return out
 }
 
 // writeJSON is shared here because the server package also needs it; to avoid

@@ -787,6 +787,73 @@ func TestNativeTransportBoundsLeaseFallbacksBeforeReset(t *testing.T) {
 }
 
 // A reset can legitimately run for 600s, but the request budget is 270s. The
+// A pool key can belong to a different account than the one whose request
+// shape was captured. Zen answers 403 Workspace access denied while this
+// account's org header is attached; the sidecar must learn the key as foreign,
+// drop the org/workspace headers for it, and retry without them.
+func TestNativeTransportForeignCredentialDropsWorkspaceIdentity(t *testing.T) {
+	bun := testBun(t)
+	dir := t.TempDir()
+	var mu sync.Mutex
+	var orgs, auths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		orgs = append(orgs, r.Header.Get("x-opencode-org-id"))
+		auths = append(auths, r.Header.Get("Authorization"))
+		n := len(orgs)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"message":"Workspace access denied"}}`)
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	writeIdentity(t, dir, srv.URL, []string{"shell", "read"})
+	path := filepath.Join(dir, "identity.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ident map[string]any
+	if err := json.Unmarshal(raw, &ident); err != nil {
+		t.Fatal(err)
+	}
+	ident["headers"] = map[string]string{
+		"x-opencode-org-id":       "org-primary",
+		"x-opencode-workspace-id": "wrk-primary",
+	}
+	raw, _ = json.Marshal(ident)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := startSidecar(t, bun, dir, "BRIDGE_MIN_START_GAP_MS=0")
+	status, _, body, err := sidecarRequestRaw(t, s.port, "primary-model", tools("Bash"),
+		map[string]string{"x-bridge-credential": "foreign-key"})
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 after dropping the foreign org", status, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(orgs) != 2 {
+		t.Fatalf("upstream attempts = %d, want 2 (reject then retry)", len(orgs))
+	}
+	if orgs[0] != "org-primary" || orgs[1] != "" {
+		t.Fatalf("org headers = %q, want [org-primary \"\"]", orgs)
+	}
+	for _, a := range auths {
+		if a != "Bearer foreign-key" {
+			t.Fatalf("authorization = %q, want the pooled key on every attempt", a)
+		}
+	}
+}
+
 // reset wait must be bounded by what is left of the budget, or a hung reset
 // pins every inflight slot and then turns the expired request into a 502.
 func TestNativeTransportResetWaitBoundedByDeadline(t *testing.T) {
@@ -1149,5 +1216,52 @@ func TestNativeTransportLongModelNameRejected(t *testing.T) {
 	_ = upstreamBody(t, cap)
 	if _, err := os.Stat(filepath.Join(dir, "identity-"+long+".json")); err == nil {
 		t.Fatalf("long model name was used as a capture filename")
+	}
+}
+
+// Some routed models reject the stock prompt-cache field with a 400 before any
+// generation. The sidecar must repair the shape once and replay, then remember
+// the model so later turns never pay that failed round trip.
+func TestNativeTransportRepairsRejectedPromptCacheField(t *testing.T) {
+	bun := testBun(t)
+	dir := t.TempDir()
+	auth := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(auth, []byte(`{"opencode":{"key":"key-one"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var hits int32
+	var firstHad, secondHad atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		body, _ := io.ReadAll(r.Body)
+		has := strings.Contains(string(body), "prompt_cache_options")
+		if n == 1 {
+			firstHad.Store(has)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "{\"error\":{\"message\":\"Unsupported parameter(s): `prompt_cache_options`\"}}")
+			return
+		}
+		secondHad.Store(has)
+		writeSSEStop(w)
+	}))
+	t.Cleanup(srv.Close)
+	writeIdentity(t, dir, srv.URL, []string{"shell", "read"})
+	s := startSidecar(t, bun, dir,
+		"BRIDGE_AUTH_JSON="+auth,
+		"BRIDGE_CREDENTIAL_DB="+filepath.Join(dir, "missing.db"))
+
+	status, _, body := sidecarRequestFull(t, s.port, "primary-model", tools("Bash"), nil,
+		map[string]any{"prompt_cache_retention": "24h"})
+	if status != http.StatusOK {
+		t.Fatalf("status %d: %s", status, body)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("upstream hits = %d, want 2 (fail, repaired retry)", got)
+	}
+	if !firstHad.Load() {
+		t.Error("first request did not carry the stock prompt-cache field; test proves nothing")
+	}
+	if secondHad.Load() {
+		t.Error("repaired retry still carried prompt_cache_options")
 	}
 }

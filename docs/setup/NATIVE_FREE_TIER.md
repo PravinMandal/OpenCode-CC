@@ -51,29 +51,37 @@ request shape. Treat the exact quota scope as empirical, not a contract.
 
 The sidecar therefore:
 
-1. derives one lease scope from the **live credential fingerprint** and client
-   session headers. The inbound `Authorization` is deleted by the Go leg before
-   the sidecar sees the request, so the credential fingerprint (not that
-   header) separates accounts;
-2. refreshes the stock OpenCode identity capture when the active OpenCode
-   credential changes. Captures contain workspace/org headers as well as the
-   system prompt and tools; sending a new account's bearer with the previous
-   account's captured workspace produced `Workspace access denied`. A request
-   waits for a current capture, and the bridge refuses to send if the account
-   changes mid-capture rather than pairing mismatched identity and credentials;
-3. persists `scope -> {id, at, goodAt, cred}` and a small pool of recently
+1. derives one lease scope from the **account identity** (the captured
+   workspace/org header) and client session headers, not from an individual
+   key. Rotating an expired key belonging to the same account must not discard
+   an established lease or open a new quota lane;
+2. captures the stock OpenCode request shape once per account. Captures contain
+   workspace/org headers as well as the system prompt and tools; sending a new
+   account's bearer with the previous account's captured workspace produces
+   `Workspace access denied`. A key change alone does not recapture; a workspace
+   denial triggers one recapture and retry, and the bridge never waits on a
+   per-request credential poll. A capture that lands while the account changes
+   is only adopted if the file it wrote is newer than the capture started;
+3. accepts the key selected by the Go credential pool on the authenticated
+   loopback leg (`x-bridge-credential`). With no header it falls back to the
+   active OpenCode database credential for standalone use. The inbound public
+   `Authorization` is stripped before this leg, so a client key never leaks
+   into the sidecar;
+4. persists `scope -> {id, at, goodAt, cred}` and a small pool of recently
    accepted ids in `~/.local/share/opencode-native/sessions.json` (durable
    write + fsync, atomic rename, `0600`, capped at 512 scopes) so a service
    restart reuses the lease instead of losing it;
-4. keeps the id for 24 hours of inactivity by default, refreshing the mapping
+5. keeps the id for 24 hours of inactivity by default, refreshing the mapping
    at most every five minutes;
-5. tries at most two recently accepted ids before invoking the shared reset
+6. tries at most two recently accepted ids before invoking the shared reset
    engine once. The former default walked all 16 ids, producing up to 17 rapid
    identical 429s before egress recovery. After a successful reset, it retries
    once and, if needed, mints one fresh id for one final attempt;
-6. caches a failed shape briefly only for the same model/request dimensions,
-   active credential, and last successful egress reset. A credential switch or
-   another successful reset must not inherit a prior account/IP's cached 429.
+7. caches a failed shape briefly only for the same model/request dimensions,
+   account identity, **credential** and last successful egress reset. The lease
+   and captured identity remain account-scoped, but the shape-failure cache is
+   key-scoped: a key rotated in after a 429 must make a real attempt instead of
+   inheriting the exhausted key's cached 429.
 
 `BRIDGE_SESSION_ID` pins one id for smoke tests or recovery. It must match the
 stock shape `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` and must not be the all-hex
@@ -90,6 +98,26 @@ empty rather than silently replaced.
 The upstream chat API is stateless and the body carries the whole conversation,
 so the id is an affinity/quota handle only, not a server-side conversation key.
 This is an observed property of the free lane, not a documented guarantee.
+
+### Long sessions and request-time pruning
+
+The free tier also rejects a request whose prompt does not fit the window's
+remaining token budget. Long agent runs accumulate tool output faster than
+anything else, and a 100k+ token prompt can be rejected even when the model's
+native context window is larger.
+
+The sidecar prunes **at request time** in `transport.mjs`:
+
+- the newest 8 tool results stay verbatim;
+- older results are replaced with the first 600 characters plus a marker;
+- if the newest 8 still exceed 64k characters, only the newest 3 stay verbatim;
+- the client's stored conversation is untouched, and the model can re-run a
+  tool when it needs the full output.
+
+This keeps the full native window available instead of advertising a smaller
+one. Kill switch: `BRIDGE_PRUNE_TOOL_RESULTS=0`. Tuning:
+`BRIDGE_PRUNE_KEEP_RESULTS`, `BRIDGE_PRUNE_PREVIEW_CHARS`. Pruning is logged as
+`context_pruned` with the result count and characters removed.
 
 ## Free-model detection
 
@@ -227,8 +255,18 @@ The sidecar adds diagnostic headers to a 429:
 
 - `x-oc-native: 1`
 - `x-oc-reset: manual` (non-quota 429), `failed` (reset failed/backoff/disabled),
-  `retried` (reset succeeded but the retry is still limited), or `shape`
-  (reset + fresh-id retry still limited; resets are skipped for this shape)
+  `retried` (reset succeeded but the retry is still limited), `shape`
+  (reset + fresh-id retry still limited; resets are skipped for this shape),
+  or `skipped` (the Go layer set `x-bridge-no-reset: 1` while rotating keys,
+  so the already-attempted egress reset must not be repeated)
+
+When Go rotates API keys after a `failed`/`shape`/`skipped` 429, it sends the
+next attempt with `x-bridge-no-reset: 1`. The sidecar still tries its bounded
+lease fallbacks, but skips the reset ladder and surfaces the 429 immediately;
+otherwise five configured keys would cycle the phone's radio five times for a
+single request. The shape-failure cache is scoped by credential as well as
+account, so a rotated key makes a real attempt instead of inheriting the
+previous key's cached 429.
 - `x-oc-reset-source: opencode-cc`
 - `retry-after` is deliberately **not** forwarded: the upstream value can be
   hours long and would lock local clients out. `x-oc-reset` describes the local

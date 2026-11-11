@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	cfgpkg "github.com/PravinMandal/OpenCode-CC/internal/config"
+
 	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
@@ -142,9 +144,14 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// a client key never leaks into the sidecar leg.
 	credential := bearerToken(r.Header.Get("Authorization"))
 	if t.pool != nil {
-		credential = t.pool.selectInitial(credential, "")
+		// Scope selection to the Zen base. A pool entry for another upstream
+		// must never have its key sent to opencode.ai as a free-tier key.
+		credential = t.pool.selectInitial(credential, cfgpkg.DefaultUpstreamBase)
 	}
 	local.Header.Del("Authorization")
+	// x-api-key is the other Zen credential carrier. A client key must not ride
+	// into the sidecar leg either.
+	local.Header.Del("x-api-key")
 	if credential != "" {
 		local.Header.Set("x-bridge-credential", credential)
 	}
@@ -153,29 +160,47 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nativeUnavailable(r, err), nil
 	}
-	// A rejected key is the one auth failure the free lane can recover from
-	// without changing request shape. Retry with the next configured key
-	// before the caller sees the 401. 429 is never retried here.
-	for attempts := 0; resp != nil && t.pool != nil && credential != "" && attempts < 8 &&
-		(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden); attempts++ {
-		prefix, _ := io.ReadAll(io.LimitReader(resp.Body, credentialErrorPeek))
-		_ = resp.Body.Close()
-		resp.Body = makeReplayBody(prefix)
-		resp.ContentLength = int64(len(prefix))
-		if !looksLikeCredentialError(resp.StatusCode, prefix) {
+	// A rejected key is recoverable without changing request shape. A 429 is
+	// recoverable by rotation too, but only as the last resort: by the time the
+	// sidecar surfaces one it has already attempted the egress reset for this
+	// request. Retries therefore carry x-bridge-no-reset so rotating through
+	// the whole pool never cycles the phone's radio once per key. nextAfter
+	// skips every key already dead or limited, so this loop is bounded by the
+	// pool size and always surfaces the real upstream error.
+	for resp != nil && t.pool != nil && credential != "" {
+		rotatable := false
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			prefix, _ := peekReplayBody(resp, credentialErrorPeek)
+			rotatable = looksLikeCredentialError(resp.StatusCode, prefix)
+			if rotatable {
+				t.pool.markDead(credential)
+			}
+		case http.StatusTooManyRequests:
+			// The sidecar sets x-oc-reset when it handled a free-limit 429.
+			// "manual" means it is not a quota response at all; rotating keys
+			// would only hide the real error.
+			switch resp.Header.Get("x-oc-reset") {
+			case "failed", "shape", "skipped":
+				t.pool.markLimited(credential)
+				rotatable = true
+			}
+		}
+		if !rotatable {
 			break
 		}
-		t.pool.markDead(credential)
-		next, ok := t.pool.nextAfter(credential, "")
+		next, ok := t.pool.nextAfter(credential, cfgpkg.DefaultUpstreamBase)
 		if !ok {
 			break
 		}
+		drainAndClose(resp.Body)
 		body, bodyErr := r.GetBody()
 		if bodyErr != nil {
 			break
 		}
 		local.Body = body
 		local.Header.Set("x-bridge-credential", next)
+		local.Header.Set("x-bridge-no-reset", "1")
 		credential = next
 		resp, err = t.local.RoundTrip(local)
 		if err != nil {

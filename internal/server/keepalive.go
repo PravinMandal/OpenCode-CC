@@ -100,6 +100,9 @@ func pingUpstream(client *http.Client, base, key string) {
 	if err != nil {
 		return
 	}
+	// A probe is not user traffic: it must warm the same connection pool but
+	// never rotate, retire, or revive credentials based on its result.
+	req = markCredentialProbe(req)
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
