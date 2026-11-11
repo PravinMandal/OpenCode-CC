@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // recoveryMaxErrBody caps how much of an upstream error body is buffered for
@@ -129,17 +129,23 @@ func (s *Server) maybeRetryInvalidEffort(
 		restoreErrorBody(resp, saved)
 		return resp, upBody, false
 	}
-	if saved2, ok2 := peekErrorBody(newResp); ok2 && proxy.IsInvalidEffortError(newResp.StatusCode, saved2) {
-		// Clamped value rejected too: remember the top as bad for next
-		// time, then relay this error (no second retry).
-		s.demoteEffortTop(targetModel)
-		log.Printf("opencode-cc: effort-clamp retry still 400 model=%s (demoted top)", incomingModel)
-		restoreErrorBody(newResp, saved2)
-	} else {
-		restoreErrorBody(newResp, saved2)
-		log.Printf("opencode-cc: effort-clamp retry model=%s -> upstream %s after=%s",
-			incomingModel, newResp.Status, time.Since(start).Round(time.Millisecond))
+	// Only inspect a retry that failed. A successful retry must be handed to
+	// the streaming relay untouched: peeking a 200 buffers the whole SSE body
+	// (and truncates it at recoveryMaxErrBody), which stalls long responses
+	// and drops tool calls mid-task.
+	if newResp.StatusCode == http.StatusBadRequest {
+		if saved2, ok2 := peekErrorBody(newResp); ok2 && proxy.IsInvalidEffortError(newResp.StatusCode, saved2) {
+			// Clamped value rejected too: remember the top as bad for next
+			// time, then relay this error (no second retry).
+			s.demoteEffortTop(targetModel)
+			log.Printf("opencode-cc: effort-clamp retry still 400 model=%s (demoted top)", incomingModel)
+			restoreErrorBody(newResp, saved2)
+		} else {
+			restoreErrorBody(newResp, saved2)
+		}
 	}
+	log.Printf("opencode-cc: effort-clamp retry model=%s -> upstream %s after=%s",
+		incomingModel, newResp.Status, time.Since(start).Round(time.Millisecond))
 	return newResp, fixed, true
 }
 

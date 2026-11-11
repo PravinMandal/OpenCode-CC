@@ -57,7 +57,17 @@ func startSidecar(t *testing.T, bun, identityDir string, extraEnv ...string) *si
 		t.Fatal(err)
 	}
 	noCapture := filepath.Join(t.TempDir(), "no-capture.mjs")
-	if err := os.WriteFile(noCapture, []byte("process.exit(0);\n"), 0o600); err != nil {
+	captureStub := `const path = process.env.BRIDGE_IDENTITY;
+const identity = JSON.parse(await Bun.file(path).text());
+identity.capturedAt = new Date().toISOString();
+try {
+  const auth = JSON.parse(await Bun.file(process.env.BRIDGE_AUTH_JSON).text());
+  identity.headers ??= {};
+  identity.headers["x-opencode-org-id"] = "org-" + auth.opencode.key;
+} catch {}
+await Bun.write(path, JSON.stringify(identity));
+`
+	if err := os.WriteFile(noCapture, []byte(captureStub), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	env := []string{
@@ -69,6 +79,8 @@ func startSidecar(t *testing.T, bun, identityDir string, extraEnv ...string) *si
 		"BRIDGE_PORT=0",
 		"BRIDGE_HOST=127.0.0.1",
 		"BRIDGE_CAPTURE=" + noCapture,
+		"BRIDGE_CREDENTIAL_DB=" + filepath.Join(identityDir, "no-credential.db"),
+		"BRIDGE_AUTH_JSON=" + filepath.Join(identityDir, "no-auth.json"),
 		"BRIDGE_CAPTURE_TIMEOUT_MS=1000",
 		"BRIDGE_SESSION_STORE=" + filepath.Join(identityDir, "sessions.json"),
 		"BRIDGE_TRACE_DIR=" + filepath.Join(identityDir, "trace"),
@@ -134,9 +146,10 @@ func startSidecar(t *testing.T, bun, identityDir string, extraEnv ...string) *si
 }
 
 type upstreamCapture struct {
-	mu   sync.Mutex
-	last []byte
-	ch   chan []byte
+	mu      sync.Mutex
+	last    []byte
+	headers http.Header
+	ch      chan []byte
 }
 
 func newFakeUpstream(t *testing.T) (*httptest.Server, *upstreamCapture) {
@@ -149,6 +162,7 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *upstreamCapture) {
 		lastSessionMu.Unlock()
 		c.mu.Lock()
 		c.last = body
+		c.headers = r.Header.Clone()
 		c.mu.Unlock()
 		select {
 		case c.ch <- body:
@@ -521,6 +535,12 @@ func lastUpstreamSession(c *upstreamCapture) string {
 	return lastSessionValue
 }
 
+func lastUpstreamHeader(c *upstreamCapture, name string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.headers.Get(name)
+}
+
 func TestNativeTransportModelTraversalRejected(t *testing.T) {
 	bun := testBun(t)
 	srv, cap := newFakeUpstream(t)
@@ -697,11 +717,10 @@ func TestNativeTransportPoolSkipsRejectedFallback(t *testing.T) {
 	}
 }
 
-// The pool must be walked to its end before spending a radio reset. The
-// fallback cap used to be 3 while the pool held 16 ids; a live id deeper than
-// 3 caused a full reset and a ten-minute shape suppression for quota the pool
-// could serve.
-func TestNativeTransportPoolReachesDeepLiveId(t *testing.T) {
+// A generic FreeUsageLimitError does not prove that every stored lease is
+// exhausted. Bound lease fallbacks so egress recovery is not delayed by a burst
+// of 16 identical 429s.
+func TestNativeTransportBoundsLeaseFallbacksBeforeReset(t *testing.T) {
 	bun := testBun(t)
 	dir := t.TempDir()
 	now := time.Now().UnixMilli()
@@ -727,15 +746,15 @@ func TestNativeTransportPoolReachesDeepLiveId(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	live := ids[len(ids)-1]
 	var mu sync.Mutex
 	var seen []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sid := r.Header.Get("x-opencode-session")
 		mu.Lock()
 		seen = append(seen, sid)
+		attempt := len(seen)
 		mu.Unlock()
-		if sid != live {
+		if attempt <= 3 {
 			writeFreeLimit429(w)
 			return
 		}
@@ -743,7 +762,13 @@ func TestNativeTransportPoolReachesDeepLiveId(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	writeIdentity(t, dir, srv.URL, []string{"shell", "read"})
-	s := startSidecar(t, bun, dir)
+	resetScript := filepath.Join(dir, "reset.sh")
+	if err := os.WriteFile(resetScript, []byte("#!/bin/sh\nprintf 'ok via phone\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := startSidecar(t, bun, dir,
+		"BRIDGE_NODE=/bin/sh",
+		"BRIDGE_RESET_SCRIPT="+resetScript)
 
 	status, _, body := sidecarRequestFull(t, s.port, "primary-model", tools("Bash"),
 		map[string]string{"x-opencode-session": "ses_0123456789abCCCCCCCCCCCCCC"}, nil)
@@ -753,16 +778,11 @@ func TestNativeTransportPoolReachesDeepLiveId(t *testing.T) {
 	mu.Lock()
 	got := append([]string(nil), seen...)
 	mu.Unlock()
-	if len(got) != len(ids)+1 {
-		t.Fatalf("upstream attempts = %v, want a fresh id plus every pool id", got)
+	if len(got) != 4 {
+		t.Fatalf("upstream attempts = %v, want initial + 2 lease fallbacks + post-reset retry", got)
 	}
-	if got[len(got)-1] != live {
-		t.Fatalf("last attempt = %q, want live pool id %q", got[len(got)-1], live)
-	}
-	for i, id := range ids {
-		if got[i+1] != id {
-			t.Fatalf("fallback %d = %q, want %q; attempts=%v", i+1, got[i+1], id, got)
-		}
+	if got[1] != ids[0] || got[2] != ids[1] {
+		t.Fatalf("lease candidates = %v, want only the two oldest before reset", got[1:3])
 	}
 }
 
@@ -867,10 +887,9 @@ func TestNativeTransportHeaderTimeoutNotRetried(t *testing.T) {
 	}
 }
 
-// A credential rotation must start a new lease lane, not pin the old account's
-// session id. The scope used to hash the inbound Authorization, which the Go
-// leg deletes before the sidecar sees the request.
-func TestNativeTransportCredentialRotationStartsNewLane(t *testing.T) {
+// Rotating an expired key must keep the account's lease lane and captured
+// headers. Identity belongs to the account, not to an individual key.
+func TestNativeTransportCredentialRotationReusesAccountLane(t *testing.T) {
 	bun := testBun(t)
 	dir := t.TempDir()
 	auth := filepath.Join(dir, "auth.json")
@@ -891,8 +910,8 @@ func TestNativeTransportCredentialRotationStartsNewLane(t *testing.T) {
 	}
 	sessionHeader := "ses_0123456789abDDDDDDDDDDDDDD"
 
-	first := startSidecar(t, bun, dir, env...)
-	status, _, body := sidecarRequestFull(t, first.port, "primary-model", tools("Bash"),
+	sidecar := startSidecar(t, bun, dir, env...)
+	status, _, body := sidecarRequestFull(t, sidecar.port, "primary-model", tools("Bash"),
 		map[string]string{"x-opencode-session": sessionHeader}, nil)
 	if status != http.StatusOK {
 		t.Fatalf("first request status %d: %s", status, body)
@@ -901,13 +920,14 @@ func TestNativeTransportCredentialRotationStartsNewLane(t *testing.T) {
 	if id1 == "" {
 		t.Fatal("no first session id")
 	}
-	_ = first.cmd.Process.Signal(syscall.SIGTERM)
-	_ = first.cmd.Wait()
-	waitForStore(t, filepath.Join(dir, "sessions.json"), `"lastGood":"`+id1+`"`)
+	if got := lastUpstreamHeader(cap, "x-opencode-org-id"); got != "org-key-one" {
+		t.Fatalf("first request org = %q, want account-one capture", got)
+	}
 
+	// Rotate the active key while the bridge remains up. Same account: the
+	// captured identity and its lease lane must survive the key change.
 	writeAuth("key-two")
-	second := startSidecar(t, bun, dir, env...)
-	status, _, body = sidecarRequestFull(t, second.port, "primary-model", tools("Bash"),
+	status, _, body = sidecarRequestFull(t, sidecar.port, "primary-model", tools("Bash"),
 		map[string]string{"x-opencode-session": sessionHeader}, nil)
 	if status != http.StatusOK {
 		t.Fatalf("second request status %d: %s", status, body)
@@ -916,8 +936,8 @@ func TestNativeTransportCredentialRotationStartsNewLane(t *testing.T) {
 	if id2 == "" {
 		t.Fatal("no second session id")
 	}
-	if id1 == id2 {
-		t.Fatalf("credential rotation reused the old account's id %q", id1)
+	if id1 != id2 {
+		t.Fatalf("same-account key rotation started a new lane: %q -> %q", id1, id2)
 	}
 }
 
@@ -964,9 +984,18 @@ func TestNativeTransportSessionOverrideShape(t *testing.T) {
 
 // A shape that survives a successful reset and a fresh-id retry is not a quota
 // incident. The next identical request must not cycle the radio again.
-func TestNativeTransportShapeFailureSkipsReset(t *testing.T) {
+func TestNativeTransportShapeFailureIsScopedToCredential(t *testing.T) {
 	bun := testBun(t)
 	dir := t.TempDir()
+	auth := filepath.Join(dir, "auth.json")
+	writeAuth := func(key string) {
+		t.Helper()
+		raw := []byte(fmt.Sprintf(`{"opencode":{"key":%q}}`, key))
+		if err := os.WriteFile(auth, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeAuth("key-one")
 	resetCount := filepath.Join(dir, "reset-count")
 	resetScript := filepath.Join(dir, "reset.sh")
 	script := "#!/bin/sh\necho x >> " + resetCount + "\necho 'ok via test'\nexit 0\n"
@@ -980,7 +1009,10 @@ func TestNativeTransportShapeFailureSkipsReset(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	writeIdentity(t, dir, srv.URL, []string{"shell", "read"})
-	s := startSidecar(t, bun, dir, "BRIDGE_NODE="+resetScript)
+	s := startSidecar(t, bun, dir,
+		"BRIDGE_NODE="+resetScript,
+		"BRIDGE_AUTH_JSON="+auth,
+		"BRIDGE_CREDENTIAL_DB="+filepath.Join(dir, "missing.db"))
 
 	status, headers, body := sidecarRequestFull(t, s.port, "primary-model", tools("Bash"), nil, nil)
 	if status != http.StatusTooManyRequests {
@@ -1005,6 +1037,20 @@ func TestNativeTransportShapeFailureSkipsReset(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&upstreamCalls); got != 4 {
 		t.Fatalf("upstream calls = %d, want 4 (3 ladder attempts + 1 shape probe)", got)
+	}
+
+	// A failed shape under one account must not suppress recovery for another
+	// account using the same prompt/tool shape.
+	writeAuth("key-two")
+	status, headers, body = sidecarRequestFull(t, s.port, "primary-model", tools("Bash"), nil, nil)
+	if status != http.StatusTooManyRequests || headers.Get("x-oc-reset") != "shape" {
+		t.Fatalf("rotated-account status=%d reset=%q body=%s", status, headers.Get("x-oc-reset"), body)
+	}
+	if got := countFileLines(t, resetCount); got != 2 {
+		t.Fatalf("reset invocations after credential rotation = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 7 {
+		t.Fatalf("upstream calls after credential rotation = %d, want 7", got)
 	}
 }
 

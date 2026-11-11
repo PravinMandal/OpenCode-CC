@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // OpenAIProxy handles POST /v1/chat/completions. Unlike Proxy, this endpoint

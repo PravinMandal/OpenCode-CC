@@ -23,10 +23,10 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/Kiowx/opencode-cc/internal/assets"
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/server"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/assets"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/server"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 func main() {

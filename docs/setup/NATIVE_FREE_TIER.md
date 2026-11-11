@@ -41,39 +41,39 @@ Local LFM3 ──────────────┘                        
   free model goes to the sidecar, everything else uses the hardened Go
   transport.
 
-## Session lease and durability
+## Session affinity, account identity, and recovery
 
-The free tier leases quota to the session id, not to the API key, organization
-or egress address. A newly generated id is answered with
-`FreeUsageLimitError` even while an established id on the same key and IP
-returns `200`. The sidecar therefore:
+Free-tier behavior is not fully documented by OpenCode. Local probes show that
+an accepted session id can matter, while successful phone-IP changes have also
+restored access in some incidents. The generic `FreeUsageLimitError` does not
+identify whether the cause is exhausted IP/account/session quota or a rejected
+request shape. Treat the exact quota scope as empirical, not a contract.
 
-1. derives one scope from the **live credential fingerprint** and the client
+The sidecar therefore:
+
+1. derives one lease scope from the **live credential fingerprint** and client
    session headers. The inbound `Authorization` is deleted by the Go leg before
    the sidecar sees the request, so the credential fingerprint (not that
-   header) is what separates accounts; a credential/account rotation starts a
-   new lease lane instead of pinning the old account's id;
-2. persists `scope -> {id, at, goodAt, cred}` and a small pool of recently
+   header) separates accounts;
+2. refreshes the stock OpenCode identity capture when the active OpenCode
+   credential changes. Captures contain workspace/org headers as well as the
+   system prompt and tools; sending a new account's bearer with the previous
+   account's captured workspace produced `Workspace access denied`. A request
+   waits for a current capture, and the bridge refuses to send if the account
+   changes mid-capture rather than pairing mismatched identity and credentials;
+3. persists `scope -> {id, at, goodAt, cred}` and a small pool of recently
    accepted ids in `~/.local/share/opencode-native/sessions.json` (durable
    write + fsync, atomic rename, `0600`, capped at 512 scopes) so a service
-   restart reuses the lease instead of losing it — the original incident was a
-   restart that forgot every id;
-3. keeps the id for 24 hours of inactivity by default, refreshing the mapping
+   restart reuses the lease instead of losing it;
+4. keeps the id for 24 hours of inactivity by default, refreshing the mapping
    at most every five minutes;
-4. keeps up to 16 accepted ids in the lease pool for 24 hours. When a fresh id
-   has no lease (typically after the daily free window closes), the sidecar
-   tries pool candidates **least-recently-good first**, up to three per
-   request, so new conversations do not all converge on one id and exhaust it
-   while the others still have quota. Only when the pool is exhausted does it
-   invoke the reset engine; after a successful reset it retries the current id
-   once, then mints one fresh id and retries once more. A rejected id is
-   removed from the pool and its scope mapping is expired, so it cannot be
-   handed back;
-5. records a failed request shape after reset + fresh-id retry still returns
-   `FreeUsageLimitError`, and skips further radio resets for that shape for
-   ten minutes (`x-oc-reset: shape`). The free tier returns the same generic
-   error for unknown clients and oversized tool surfaces, so without this a
-   shape that can never pass would cycle the phone once per turn.
+5. tries at most two recently accepted ids before invoking the shared reset
+   engine once. The former default walked all 16 ids, producing up to 17 rapid
+   identical 429s before egress recovery. After a successful reset, it retries
+   once and, if needed, mints one fresh id for one final attempt;
+6. caches a failed shape briefly only for the same model/request dimensions,
+   active credential, and last successful egress reset. A credential switch or
+   another successful reset must not inherit a prior account/IP's cached 429.
 
 `BRIDGE_SESSION_ID` pins one id for smoke tests or recovery. It must match the
 stock shape `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` and must not be the all-hex
@@ -204,7 +204,7 @@ All knobs are optional environment variables read by the sidecar:
 | `BRIDGE_SESSION_ID` | unset | pin one upstream session id (smoke tests, recovery) |
 | `BRIDGE_LEASE_POOL_TTL_MS` | `86400000` | age after which an accepted id leaves the fallback pool |
 | `BRIDGE_LEASE_POOL_LIMIT` | `16` | maximum accepted ids kept in the fallback pool |
-| `BRIDGE_LEASE_FALLBACK_ATTEMPTS` | `3` | pool ids tried before a reset |
+| `BRIDGE_LEASE_FALLBACK_ATTEMPTS` | `2` | pool ids tried before a reset |
 | `BRIDGE_SHAPE_FAILURE_TTL_MS` | `600000` | how long an unpassable request shape skips radio resets |
 | `BRIDGE_CAPTURE_MODEL_TIMEOUT_MS` | derived | per-model identity capture timeout |
 | `BRIDGE_RESET_STATE` / `BRIDGE_RESET_LOCK` | the engine defaults | override only for tests |
@@ -214,15 +214,14 @@ All knobs are optional environment variables read by the sidecar:
 ### Quota handling
 
 A non-quota 429 is returned to the caller as-is. A free-tier
-`FreeUsageLimitError` is evaluated against the request's session lease: an
-established id can be allowed while a fresh id on the same key, org and IP is
-denied. The sidecar walks the lease ladder described above (pool → reset →
-fresh id), then calls the shared reset engine
-(`request-reset.mjs --source=opencode-cc`, `RESET_ALLOW_AUTOMATIC=1`) at most
-once, joins a reset already in flight or waits out a foreign lock. The reset
-path remains for a genuinely exhausted IP; it is not a substitute for session
-reuse. The sidecar surfaces a 429 only when the reset failed, the retry is
-still limited, or the request shape is marked unpassable.
+`FreeUsageLimitError` is ambiguous: it can reflect quota state, account/session
+affinity, or a request rejected by the free-tier gate. The sidecar walks the
+bounded recovery ladder described above (up to two pool ids → one reset → one
+fresh id), joins a reset already in flight or waits out a foreign lock. The
+bridge does not claim that every successful IP change guarantees quota; the
+provider does not publish enough detail to distinguish these causes from the
+error body alone. A 429 is surfaced when recovery is unsuccessful or the
+current account/egress/request combination is still rejected.
 
 The sidecar adds diagnostic headers to a 429:
 

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
 )
 
 // stallOnceUpstream stalls past any short header timeout on the first request

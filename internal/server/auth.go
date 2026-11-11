@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 // ctxKey is unexported so callers can't fabricate the context value.

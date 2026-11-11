@@ -21,6 +21,10 @@ func (f fakeNative) Endpoint() (string, string, error) {
 	return f.url, f.token, f.err
 }
 
+func staticNativeTransport(base http.RoundTripper, mgr nativeEndpoint) http.RoundTripper {
+	return newNativeTransport(base, mgr, nil)
+}
+
 type recorderTransport struct {
 	mu    sync.Mutex
 	calls []*http.Request
@@ -70,7 +74,7 @@ func TestNativeTransportRoutesEveryFreeModel(t *testing.T) {
 	} {
 		t.Run(model, func(t *testing.T) {
 			base := &recorderTransport{}
-			tr := newNativeTransport(base, fakeNative{url: sidecar.URL + "/v1/chat/completions", token: "tok"})
+			tr := staticNativeTransport(base, fakeNative{url: sidecar.URL + "/v1/chat/completions", token: "tok"})
 			req := zenRequest(t, model)
 			resp, err := tr.RoundTrip(req)
 			if err != nil {
@@ -106,7 +110,7 @@ func TestNativeTransportLeavesPaidModelsAlone(t *testing.T) {
 	defer sidecar.Close()
 
 	base := &recorderTransport{}
-	tr := newNativeTransport(base, fakeNative{url: sidecar.URL + "/v1/chat/completions", token: "tok"})
+	tr := staticNativeTransport(base, fakeNative{url: sidecar.URL + "/v1/chat/completions", token: "tok"})
 	req := zenRequest(t, "claude-sonnet-5")
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
@@ -120,7 +124,7 @@ func TestNativeTransportLeavesPaidModelsAlone(t *testing.T) {
 
 func TestNativeTransportLeavesNonZenTrafficAlone(t *testing.T) {
 	base := &recorderTransport{}
-	tr := newNativeTransport(base, fakeNative{url: "http://127.0.0.1:1/v1/chat/completions", token: "tok"})
+	tr := staticNativeTransport(base, fakeNative{url: "http://127.0.0.1:1/v1/chat/completions", token: "tok"})
 	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{"model":"glm-5.3-flash-free"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +141,7 @@ func TestNativeTransportLeavesNonZenTrafficAlone(t *testing.T) {
 
 func TestNativeTransportUnavailableIs503(t *testing.T) {
 	base := &recorderTransport{}
-	tr := newNativeTransport(base, fakeNative{err: errors.New("sidecar is still starting")})
+	tr := staticNativeTransport(base, fakeNative{err: errors.New("sidecar is still starting")})
 	resp, err := tr.RoundTrip(zenRequest(t, "glm-5.3-flash-free"))
 	if err != nil {
 		t.Fatal(err)

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 func TestSanitizePassthroughDedupesOutputsAndCoercesToolChoice(t *testing.T) {

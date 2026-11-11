@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 // newEmptyRescueTestServer exposes /v1/chat/completions with the empty

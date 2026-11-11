@@ -108,6 +108,28 @@ func TestActiveOpenCodeCredentialMissingDatabaseIsNotCreated(t *testing.T) {
 	}
 }
 
+func TestResolveUpstreamCredentialEnvAndFile(t *testing.T) {
+	t.Setenv("OPENCODE_CC_TEST_KEY", "  env-key-fixture  ")
+	key, err := ResolveUpstreamCredential("https://opencode.ai/inference", "env:OPENCODE_CC_TEST_KEY")
+	if err != nil || key != "env-key-fixture" {
+		t.Fatalf("env key = %q, err %v", key, err)
+	}
+	if _, err := ResolveUpstreamCredential("https://opencode.ai/inference", "env:OPENCODE_CC_MISSING_KEY"); err == nil {
+		t.Fatal("empty env key must fail closed")
+	}
+	path := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(path, []byte("file-key-fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key, err = ResolveUpstreamCredential("https://opencode.ai/inference", "file:"+path)
+	if err != nil || key != "file-key-fixture" {
+		t.Fatalf("file key = %q, err %v", key, err)
+	}
+	if _, err := ResolveUpstreamCredential("https://opencode.ai/inference", "file:"+path+".missing"); err == nil {
+		t.Fatal("missing key file must fail closed")
+	}
+}
+
 func TestActiveOpenCodeCredentialRestrictedToOfficialHTTPSOrigin(t *testing.T) {
 	for _, base := range []string{"http://opencode.ai/inference", "https://other.example", "https://opencode.ai.attacker.example", "https://opencode.ai:444", "https://user@opencode.ai"} {
 		if _, err := ResolveUpstreamCredential(base, OpenCodeActiveCredential); err == nil {

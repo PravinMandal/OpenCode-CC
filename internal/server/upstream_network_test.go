@@ -84,7 +84,7 @@ func TestProxyHostUnreachableRecoversBeforeFailingClient(t *testing.T) {
 	proxy, hits := networkFaultProxy(t, strings.TrimPrefix(target.URL, "http://"), 1)
 	u, _ := url.Parse(proxy)
 	srv := New(cfgFor(t, "http://upstream.invalid"), nil)
-	srv.httpClient.Transport.(*http.Transport).Proxy = http.ProxyURL(u)
+	rawHTTPTransport(srv.httpClient.Transport).Proxy = http.ProxyURL(u)
 	defer srv.httpClient.CloseIdleConnections()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hello"}]}`))
 	rr := httptest.NewRecorder()
@@ -98,7 +98,7 @@ func TestPersistentProxyFailureReturnsShortServiceRetry(t *testing.T) {
 	proxy, hits := networkFaultProxy(t, "", 100)
 	u, _ := url.Parse(proxy)
 	srv := New(cfgFor(t, "http://upstream.invalid"), nil)
-	srv.httpClient.Transport.(*http.Transport).Proxy = http.ProxyURL(u)
+	rawHTTPTransport(srv.httpClient.Transport).Proxy = http.ProxyURL(u)
 	defer srv.httpClient.CloseIdleConnections()
 	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
 		rr := httptest.NewRecorder()

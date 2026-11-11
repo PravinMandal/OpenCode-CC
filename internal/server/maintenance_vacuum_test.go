@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 // TestVacuumSchedulePersistsAcrossRestarts proves the VACUUM interval is

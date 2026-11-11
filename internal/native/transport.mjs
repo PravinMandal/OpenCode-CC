@@ -85,6 +85,51 @@ const REWRITE_ENV = process.env.BRIDGE_REWRITE_ENV !== "0";
 const MAX_TOOLS = Number(process.env.BRIDGE_MAX_TOOLS || 19);
 // Opt-in request capture for diagnosing shape rejections. Off in production.
 const TRACE_DIR = process.env.BRIDGE_TRACE_DIR || "";
+// Free-tier requests are also limited by prompt size in the current window.
+// Keep the newest tool results verbatim; older ones are replaced with a short
+// preview. The stored client history is untouched, and the model can re-run a
+// tool when it needs the full output. This is request-time pruning, not a
+// smaller context window.
+const PRUNE_TOOL_RESULTS = process.env.BRIDGE_PRUNE_TOOL_RESULTS !== "0";
+const PRUNE_KEEP_RESULTS = Math.max(2, Number(process.env.BRIDGE_PRUNE_KEEP_RESULTS || 8) || 8);
+const PRUNE_PREVIEW_CHARS = Math.max(200, Number(process.env.BRIDGE_PRUNE_PREVIEW_CHARS || 600) || 600);
+const PRUNE_MARKER = "\n\n[opencode-cc: older tool output pruned to fit the free-tier window. Re-run the tool if you need the full result.]";
+
+function toolContentSize(content) {
+  if (typeof content === "string") return content.length;
+  try { return JSON.stringify(content ?? "").length; } catch { return 0; }
+}
+
+function pruneOldToolResults(messages) {
+  if (!PRUNE_TOOL_RESULTS || !Array.isArray(messages)) return { pruned: 0, chars: 0 };
+  const idx = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.role === "tool") idx.push(i);
+  }
+  if (idx.length <= PRUNE_KEEP_RESULTS) return { pruned: 0, chars: 0 };
+
+  let keep = new Set(idx.slice(-PRUNE_KEEP_RESULTS));
+  // A handful of huge recent results can still exceed the window's remaining
+  // budget. In that case keep the newest three and prune the rest.
+  const keptChars = [...keep].reduce((n, i) => n + toolContentSize(messages[i].content), 0);
+  if (keptChars > 64_000 && idx.length > 3) {
+    keep = new Set(idx.slice(-3));
+  }
+
+  let pruned = 0;
+  let chars = 0;
+  for (const i of idx) {
+    if (keep.has(i)) continue;
+    const m = messages[i];
+    const before = toolContentSize(m.content);
+    if (before <= PRUNE_PREVIEW_CHARS + PRUNE_MARKER.length) continue;
+    const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+    m.content = text.slice(0, PRUNE_PREVIEW_CHARS) + PRUNE_MARKER;
+    pruned++;
+    chars += before - PRUNE_PREVIEW_CHARS;
+  }
+  return { pruned, chars };
+}
 // Free-tier quota recovery. The reset script is the single writer of reset
 // state and owns the radio; this layer only decides when to invoke it and
 // retries the request once. A concurrent reset (the OpenCode plugin, or a
@@ -122,9 +167,13 @@ let suppressedSignature = "";
 
 // ---------------------------------------------------------------- credentials
 let credential = { value: "", readAt: 0 };
-function liveCredential() {
+function liveCredential(forceRefresh = false, override = "") {
+  // A key supplied by the Go layer (multi-key pool) wins over the local
+  // OpenCode database. Same-account keys share the captured identity, so this
+  // does not change the request shape.
+  if (override) return override;
   const now = Date.now();
-  if (credential.value && now - credential.readAt < 60_000) return credential.value;
+  if (!forceRefresh && credential.value && now - credential.readAt < 60_000) return credential.value;
   let key = "";
   let db = null;
   try {
@@ -155,8 +204,36 @@ function liveCredential() {
 // means a credential/account rotation starts a new lease lane instead of
 // pinning the old account's id forever. Go deletes the inbound Authorization
 // before this leg, so the sidecar's own live credential is the real input.
-function credentialFingerprint() {
-  return sha(liveCredential() || "anonymous").slice(0, 16);
+function credentialFingerprint(forceRefresh = false, override = "") {
+  return sha(liveCredential(forceRefresh, override) || "anonymous").slice(0, 16);
+}
+
+// accountScope is the stable identity of the account, not of one key. Leases
+// and identity captures belong to the account: rotating an expired key must
+// not throw away an established quota lease or force a full recapture.
+function accountScope() {
+  const org = identity?.headers?.["x-opencode-org-id"] || identity?.headers?.["x-opencode-workspace-id"] || "";
+  return org ? "account:" + org : "";
+}
+
+function inboundCredential(inbound) {
+  return String(headerValue(inbound, "x-bridge-credential") || "").trim();
+}
+
+// identityReady reports whether the capture has the fields the free-tier gate
+// needs, including the account/workspace header. An identity written by an
+// older bridge may predate that header; capturing once is cheap compared with
+// sending a request the upstream will reject.
+function identityReady() {
+  return !!(identity && typeof identity.system === "string" &&
+    Array.isArray(identity.tools) && identity.tools.length && accountScope());
+}
+
+// leaseAccount scopes lease reuse to the account. When the identity has no
+// org header yet, fall back to the key fingerprint for a stable bootstrap
+// scope. Once the capture is loaded, key rotation no longer resets leases.
+function leaseAccount(override = "") {
+  return accountScope() || ("cred:" + credentialFingerprint(false, override));
 }
 
 // ------------------------------------------------------------------ identity
@@ -266,6 +343,7 @@ async function refreshIdentity(reason, models) {
     return;
   }
   refreshing = true;
+  const captureStartedAt = Date.now();
   log({ event: "identity_refresh_start", reason, models: models || null });
   try {
     const env = { ...process.env };
@@ -288,7 +366,14 @@ async function refreshIdentity(reason, models) {
     const out = (await new Response(proc.stdout).text()).trim().slice(0, 300);
     log({ event: "identity_refresh_done", code, out });
     const fresh = await loadIdentity();
-    if (fresh) identity = fresh;
+    const freshCapturedAt = Date.parse(fresh?.capturedAt || "");
+    if (fresh && freshCapturedAt >= captureStartedAt) {
+      identity = fresh;
+    } else if (fresh) {
+      // Capture failed and left the old file in place. Keep serving the old
+      // identity; the next scheduled refresh will try again.
+      log({ event: "identity_refresh_not_current", capturedAt: fresh.capturedAt || null });
+    }
     // The per-model cache holds the old captures; drop it so the next lookup
     // reads the files the refresh just wrote.
     modelIdentities.clear();
@@ -358,6 +443,24 @@ async function ensureIdentity() {
   }
 }
 
+let lastIdentityAttempt = 0;
+async function ensureIdentityForCredential(credentialOverride = "") {
+  // Identity belongs to the account, not to an individual key. A configured
+  // pool may rotate an expired key at any time; that must not trigger a full
+  // recapture (which can take minutes and would stall the request).
+  if (identityReady()) return;
+  while (refreshing) await Bun.sleep(100);
+  if (identityReady()) return;
+  // If a previous capture failed, serve the old shape for a minute instead of
+  // spawning a capture process on every request.
+  if (identity && Date.now() - lastIdentityAttempt < 60_000) return;
+  lastIdentityAttempt = Date.now();
+  await refreshIdentity("missing_identity");
+  while (refreshing) await Bun.sleep(100);
+  if (identity) return;
+  throw new Error("no OpenCode identity available for active credential");
+}
+
 // ------------------------------------------------------------------- headers
 const sessions = new Map();
 const ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -419,12 +522,12 @@ const SESSION_OVERRIDE = (() => {
 // rotate through the pool least-recently-good first.
 const LEASE_POOL_TTL_MS = Number(process.env.BRIDGE_LEASE_POOL_TTL_MS || 86_400_000);
 const LEASE_POOL_LIMIT = Number(process.env.BRIDGE_LEASE_POOL_LIMIT || 16);
-// A rejected lease costs one fast 429, so walk the whole pool before spending
-// a radio reset. Capping this below LEASE_POOL_LIMIT let a live id sit deeper
-// than the cap: the request rotated the egress for quota the pool could serve,
-// then suppressed the shape for ten minutes.
+// Try only a couple of known-good ids before egress recovery. Walking all 16 on
+// every FreeUsageLimitError produced bursts of identical 429s and delayed the
+// IP reset; the upstream error does not tell us whether an id or the egress is
+// exhausted. Operators may tune this explicitly for controlled diagnostics.
 const LEASE_FALLBACK_ATTEMPTS = Number(
-  process.env.BRIDGE_LEASE_FALLBACK_ATTEMPTS || LEASE_POOL_LIMIT,
+  process.env.BRIDGE_LEASE_FALLBACK_ATTEMPTS || Math.min(2, LEASE_POOL_LIMIT),
 );
 // A request shape that survived a successful reset and a fresh-id retry is not
 // a quota problem. Remember it briefly so the phone does not cycle data once
@@ -481,7 +584,7 @@ function pruneLeasePool(now = Date.now()) {
   }
 }
 
-function rememberLease(id, at = Date.now(), cred = credentialFingerprint()) {
+function rememberLease(id, at = Date.now(), cred = leaseAccount()) {
   if (!validSessionId(id)) return;
   const prev = leasePool.get(id);
   leasePool.set(id, { goodAt: Math.max(at, prev?.goodAt || 0), cred });
@@ -503,7 +606,7 @@ function forgetLease(id) {
 
 function nextLeaseCandidate(exclude) {
   const now = Date.now();
-  const cred = credentialFingerprint();
+  const cred = leaseAccount();
   pruneLeasePool(now);
   const candidates = [];
   for (const [id, rec] of leasePool) {
@@ -518,12 +621,19 @@ function nextLeaseCandidate(exclude) {
 
 function leaseShapeKey(meta) {
   const shape = meta?.shape || {};
+  const reset = readResetState();
   return sha(JSON.stringify({
+    credential: leaseAccount(),
+    resetAt: Number(reset.lastSuccessAt || 0),
+    egress4: String(reset.lastIp4 || ""),
+    egress6: String(reset.lastIp || ""),
     model: String(meta?.model || "").toLowerCase(),
     tools: shape.tools || 0,
     toolChars: shape.toolChars || 0,
     systemChars: shape.systemChars || 0,
-    reasoning: shape.reasoningChars ? 1 : 0,
+    messages: shape.messages || 0,
+    messageChars: shape.messageChars || 0,
+    reasoningChars: shape.reasoningChars || 0,
   })).slice(0, 16);
 }
 
@@ -558,7 +668,7 @@ function loadSessions() {
     }
     return;
   }
-  const cred = credentialFingerprint();
+  const cred = leaseAccount();
   const savedAt = Number(raw?.savedAt || 0);
   if (validSessionId(raw?.lastGood)) {
     const at = Number(raw?.lastGoodAt || savedAt || Date.now());
@@ -631,7 +741,7 @@ function persistSessions() {
       savedAt: Date.now(),
       lastGood: validSessionId(lastGoodSession) ? lastGoodSession : undefined,
       lastGoodAt: lastGoodAt || undefined,
-      credential: credentialFingerprint(),
+      credential: leaseAccount(),
       pool: [...leasePool.entries()].map(([id, rec]) => ({
         id, goodAt: rec.goodAt, cred: rec.cred,
       })),
@@ -687,7 +797,7 @@ function sessionFor(scope) {
     }
     if (oldestScope) sessions.delete(oldestScope);
   }
-  sessions.set(scope, { id, at: now, persistedAt: now, goodAt: 0, cred: credentialFingerprint() });
+  sessions.set(scope, { id, at: now, persistedAt: now, goodAt: 0, cred: leaseAccount() });
   scheduleSessionPersist();
   return id;
 }
@@ -698,7 +808,7 @@ function sessionFor(scope) {
 function markGoodSession(scope, id) {
   if (!validSessionId(id)) return;
   const now = Date.now();
-  const cred = credentialFingerprint();
+  const cred = leaseAccount();
   lastGoodSession = id;
   lastGoodAt = now;
   lastGoodCred = cred;
@@ -759,16 +869,16 @@ function headerValue(source, name) {
   return source[name] ?? source[name.toLowerCase()] ?? "";
 }
 
-function leaseFor(inbound) {
-  // Include the live credential fingerprint: a lease is minted by one account,
-  // and after a credential rotation the old account's id must not be pinned.
+function leaseFor(inbound, credentialOverride = "") {
+  // Scope by account, never by the individual key: rotating an expired key
+  // must not pin a new account lane or discard the leased session.
   const scope = sha(
     headerValue(inbound, "authorization") + "|" + headerValue(inbound, "x-opencode-session") +
-    "|" + headerValue(inbound, "x-session-id") + "|" + credentialFingerprint());
+    "|" + headerValue(inbound, "x-session-id") + "|" + leaseAccount(credentialOverride));
   return { scope, id: sessionFor(scope) };
 }
 
-function upstreamHeaders(modelName, sessionId) {
+function upstreamHeaders(modelName, sessionId, credentialOverride = "") {
   const modelIdent = getModelIdentity(modelName);
   const headers = new Headers({
     ...baseHeaders(modelIdent?.headers),
@@ -779,7 +889,7 @@ function upstreamHeaders(modelName, sessionId) {
     "x-session-id": sessionId,
     ...traceIds(),
   });
-  const key = liveCredential();
+  const key = liveCredential(false, credentialOverride);
   if (key) headers.set("authorization", `Bearer ${key}`);
   return headers;
 }
@@ -1093,6 +1203,14 @@ function normalize(raw) {
   const wantsStream = parsed.stream === true;
   parsed.stream = true;
   parsed.stream_options = { ...(parsed.stream_options || {}), include_usage: true };
+
+  // Request-time pruning: keep the shape stable but stop old tool output from
+  // consuming the free window's remaining token budget. The client's stored
+  // history is unchanged.
+  const pruned = pruneOldToolResults(parsed.messages);
+  if (pruned.pruned > 0) {
+    log({ event: "context_pruned", results: pruned.pruned, chars: pruned.chars, model: parsed.model });
+  }
 
   // Request shape, so a 429 can be traced to what the caller actually sent:
   // tool count, system size, and whether reasoning is being replayed.
@@ -1492,14 +1610,15 @@ function passThrough429(response, text, reset) {
 //      shape briefly so the radio is not cycled again for a shape the gate
 //      will always reject.
 async function upstream(body, inbound, meta, lease) {
+  const credentialOverride = inboundCredential(inbound);
   let transportFailures = 0;
   let resetDone = false;
   let freshAfterResetDone = false;
   let leaseFallbacks = 0;
   let postResetGrace = false;
+  let accountRecaptureDone = false;
   let last429 = null;
   let sessionId = lease.id;
-  const shapeKey = leaseShapeKey(meta);
   const totalDeadline = Number(meta.started || Date.now()) + HEADER_TIMEOUT + TRANSPORT_RETRY_BUDGET_MS;
   for (let attempt = 1; ; attempt++) {
     await paceStart();
@@ -1524,7 +1643,7 @@ async function upstream(body, inbound, meta, lease) {
     try {
       response = await fetch(identity.endpoint, {
         method: "POST",
-        headers: upstreamHeaders(meta?.model, sessionId),
+        headers: upstreamHeaders(meta?.model, sessionId, credentialOverride),
         body,
         signal: AbortSignal.any([inbound.signal, controller.signal]),
       });
@@ -1546,6 +1665,20 @@ async function upstream(body, inbound, meta, lease) {
     // Only an SSE body can be rebuilt into a completion. An upstream error
     // body (400/500 JSON) must pass through with its real status, or the
     // caller loses the provider's message behind a fake "truncated stream".
+    // Account mismatch is the one identity failure recovery can repair: the
+    // active account changed while the bridge kept running. Recapture once and
+    // retry, instead of polling the credential on every request.
+    if (response.status === 403 && !accountRecaptureDone) {
+      const text = await response.text();
+      if (/workspace|access denied|wrong workspace|forbidden/i.test(text)) {
+        accountRecaptureDone = true;
+        log({ event: "identity_account_mismatch", ...meta, attempt, body: text.slice(0, 200) });
+        await refreshIdentity("account_mismatch");
+        postResetGrace = true;
+        continue;
+      }
+      return new Response(text, { status: response.status, headers: new Headers(response.headers) });
+    }
     if (response.status !== 429) {
       if (response.ok) markGoodSession(lease.scope, sessionId);
       // Logged after the lease is recorded: an accepted fresh id is leased
@@ -1569,8 +1702,10 @@ async function upstream(body, inbound, meta, lease) {
       return passThrough429(response, text, "manual");
     }
 
-    // A shape that already survived reset + fresh-id retry is not a quota
-    // incident; cycling the radio for it only disrupts every other request.
+    // The generic error cannot distinguish quota from request shape. Scope a
+    // cached failure to the active account and last successful egress reset so
+    // an account switch or a new IP does not inherit another lane's failure.
+    const shapeKey = leaseShapeKey(meta);
     const blockedAt = shapeFailureAt(shapeKey);
     if (blockedAt) {
       log({ event: "quota_reset_skipped_shape", ...meta, attempt, ageMs: Date.now() - blockedAt });
@@ -1718,6 +1853,7 @@ const server = Bun.serve({
     const started = Date.now();
     inflight++;
     try {
+      await ensureIdentityForCredential(inboundCredential(request));
       let normalized;
       try {
         normalized = normalize(await request.text());
@@ -1746,7 +1882,7 @@ const server = Bun.serve({
 
       return await upstream(body, request, {
         model, started, bytes: body.length, wantsStream: normalized.wantsStream, shape: normalized.shape,
-      }, leaseFor(request));
+      }, leaseFor(request, inboundCredential(request)));
     } catch (error) {
       if (request.signal.aborted) return new Response(null, { status: 499 });
       log({ event: "transport_failure", model, ms: Date.now() - started, error: String(error) });

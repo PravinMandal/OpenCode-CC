@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/metrics"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/metrics"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 // ---------------------------------------------------------------------------

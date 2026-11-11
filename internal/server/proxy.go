@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	cfgpkg "github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/proxy"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	cfgpkg "github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 // Proxy handles POST /v1/messages. Native Anthropic-capable target models go

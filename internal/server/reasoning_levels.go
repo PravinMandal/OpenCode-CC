@@ -26,7 +26,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // builtinEffortFamilies maps lowercase model-id prefixes to live-verified

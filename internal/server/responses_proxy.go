@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // ResponsesProxy handles POST /v1/responses for Codex and other Responses API

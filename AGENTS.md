@@ -138,14 +138,16 @@
   `ds-flash.conf` drop-in; `OPENCODE_CC_DS_FLASH_FETCH_URL` is no longer read.
 - The Bun hop is not optional: the same request returns 200 from Bun and 429
   from Go, Node, Python or curl. Do not "simplify" it into the Go transport.
-- The free tier accepts the captured 13 OpenCode tools. Appending client tools
+- The free tier accepts the captured OpenCode tools. Appending client tools
   makes the request look like an unknown client: 19 tools 429ed while the same
   turn at 13 returned 200 (2026-11-02). The sidecar sends canonical-only and
   translates each call back to the client's tool name and arguments. A
-  non-quota 429 is returned as-is. A free-tier `FreeUsageLimitError` is
-  IP-scoped: the sidecar may invoke the shared `request-reset.mjs` engine once
-  (`--source=opencode-cc`, `RESET_ALLOW_AUTOMATIC=1`) and retry the request
-  once. Never probe the budget, rotate the egress yourself, or retry in a loop.
+  non-quota 429 is returned as-is. The generic `FreeUsageLimitError` does not
+  disclose whether quota, account/session affinity, or request shape was
+  rejected. Recovery tries at most two accepted session IDs, then may invoke
+  the shared `request-reset.mjs` engine once (`--source=opencode-cc`,
+  `RESET_ALLOW_AUTOMATIC=1`) and retry. Never probe the budget, rotate the
+  egress yourself, or retry in an unbounded loop.
 - OpenCode CLI and T3 OpenCode stay direct to opencode.ai. CPA fronts Claude,
   Codex, Antigravity and LFM3 only. CPA has exactly one `opencode-cc` Claude
   provider, and both free aliases (`oc/...`) live on it.

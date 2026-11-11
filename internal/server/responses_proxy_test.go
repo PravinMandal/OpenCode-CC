@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 func TestResponsesNonStream(t *testing.T) {

@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/api"
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/native"
-	"github.com/Kiowx/opencode-cc/internal/proxy"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/api"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/native"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 // Server is the top-level HTTP server. It owns the config, store, and the
@@ -26,6 +26,7 @@ type Server struct {
 	srv          *http.Server
 	effortLevels *EffortLevelsCache
 	cooldowns    *cooldownTracker
+	credPool     *credentialPool
 
 	// done is closed by Shutdown to stop background loops (keep-alive pinger).
 	done chan struct{}
@@ -107,7 +108,13 @@ func New(cfg *config.Config, st *store.Store) *Server {
 			},
 		},
 	}
-	s.httpClient.Transport = newNativeTransport(s.httpClient.Transport, s.native)
+	if cfg != nil {
+		s.credPool = newCredentialPool(cfg)
+		paid := newCredentialFailoverTransport(s.httpClient.Transport, s.credPool)
+		s.httpClient.Transport = newNativeTransport(paid, s.native, s.credPool)
+	} else {
+		s.httpClient.Transport = newNativeTransport(s.httpClient.Transport, s.native, nil)
+	}
 	return s
 }
 

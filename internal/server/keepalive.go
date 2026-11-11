@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
 )
 
 // keepAliveInterval is how often each configured upstream is pinged to hold

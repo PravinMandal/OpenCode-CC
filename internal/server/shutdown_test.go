@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
 )
 
 // TestShutdownPublishesServerBeforeStartup: a signal can arrive while Start is

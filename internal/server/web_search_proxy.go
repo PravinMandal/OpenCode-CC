@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 type webSearchCall struct {

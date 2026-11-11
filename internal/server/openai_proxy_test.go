@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 func newOpenAITestServer(t *testing.T, upstream http.Handler) (*Server, *store.Store, *httptest.Server) {

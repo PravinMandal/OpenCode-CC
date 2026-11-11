@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,7 +21,38 @@ const OpenCodeActiveCredential = "opencode://active"
 // selection. OpenCode alone owns refresh/rotation: never reuse its refresh
 // token, write its database, or persist its access token in the relay config.
 func ResolveUpstreamCredential(base, configured string) (string, error) {
-	if configured != OpenCodeActiveCredential {
+	configured = strings.TrimSpace(configured)
+	switch {
+	case configured == OpenCodeActiveCredential:
+		// handled below
+	case strings.HasPrefix(configured, "env:"):
+		name := strings.TrimSpace(strings.TrimPrefix(configured, "env:"))
+		if name == "" {
+			return "", errors.New("upstream credential env reference has no variable name")
+		}
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			return "", errors.New("upstream credential environment variable is empty or unset: " + name)
+		}
+		return value, nil
+	case strings.HasPrefix(configured, "file:"):
+		path := strings.TrimSpace(strings.TrimPrefix(configured, "file:"))
+		if path == "" {
+			return "", errors.New("upstream credential file reference has no path")
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", errors.New("cannot read upstream credential file: " + path)
+		}
+		value := strings.TrimSpace(string(raw))
+		if value == "" {
+			return "", errors.New("upstream credential file is empty: " + path)
+		}
+		return value, nil
+	default:
+		if configured == "" {
+			return "", errors.New("upstream credential is empty")
+		}
 		return configured, nil
 	}
 	u, err := url.Parse(base)

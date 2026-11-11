@@ -3,8 +3,8 @@ package server
 import (
 	"strings"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 func applyThinkingBudgetMapping(req *proxy.OpenAIRequest, areq *proxy.AnthropicRequest, targetModel string, cfg *config.Config) {

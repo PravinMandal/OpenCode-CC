@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // Free-tier marker-tool filtering for the OpenAI Chat Completions lane.

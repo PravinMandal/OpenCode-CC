@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // nativeTransport routes every free-tier chat completion through the Bun
@@ -31,15 +31,17 @@ type nativeTransport struct {
 	base  http.RoundTripper
 	local *http.Transport
 	mgr   nativeEndpoint
+	pool  *credentialPool
 }
 
-func newNativeTransport(base http.RoundTripper, mgr nativeEndpoint) http.RoundTripper {
+func newNativeTransport(base http.RoundTripper, mgr nativeEndpoint, pool *credentialPool) http.RoundTripper {
 	if mgr == nil || !mgr.Enabled() {
 		return base
 	}
 	return &nativeTransport{
 		base: base,
 		mgr:  mgr,
+		pool: pool,
 		local: &http.Transport{
 			// Loopback only: never inherit HTTP(S)_PROXY here.
 			Proxy:               nil,
@@ -133,13 +135,52 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	local.Host = u.Host
 	local.Header = r.Header.Clone()
 	local.Header.Set("x-bridge-token", token)
-	// The sidecar resolves the live OpenCode credential itself; the inbound
-	// key is for opencode-cc, not Zen, and must not leak into this leg.
+	// The sidecar resolves the live OpenCode credential itself when no
+	// credential header is present (standalone use). When this request came
+	// through the pool, pass the key the handler selected so key failover
+	// applies to the free lane too. The inbound Authorization is stripped so
+	// a client key never leaks into the sidecar leg.
+	credential := bearerToken(r.Header.Get("Authorization"))
+	if t.pool != nil {
+		credential = t.pool.selectInitial(credential, "")
+	}
 	local.Header.Del("Authorization")
+	if credential != "" {
+		local.Header.Set("x-bridge-credential", credential)
+	}
 
 	resp, err := t.local.RoundTrip(local)
 	if err != nil {
 		return nativeUnavailable(r, err), nil
+	}
+	// A rejected key is the one auth failure the free lane can recover from
+	// without changing request shape. Retry with the next configured key
+	// before the caller sees the 401. 429 is never retried here.
+	for attempts := 0; resp != nil && t.pool != nil && credential != "" && attempts < 8 &&
+		(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden); attempts++ {
+		prefix, _ := io.ReadAll(io.LimitReader(resp.Body, credentialErrorPeek))
+		_ = resp.Body.Close()
+		resp.Body = makeReplayBody(prefix)
+		resp.ContentLength = int64(len(prefix))
+		if !looksLikeCredentialError(resp.StatusCode, prefix) {
+			break
+		}
+		t.pool.markDead(credential)
+		next, ok := t.pool.nextAfter(credential, "")
+		if !ok {
+			break
+		}
+		body, bodyErr := r.GetBody()
+		if bodyErr != nil {
+			break
+		}
+		local.Body = body
+		local.Header.Set("x-bridge-credential", next)
+		credential = next
+		resp, err = t.local.RoundTrip(local)
+		if err != nil {
+			return nativeUnavailable(r, err), nil
+		}
 	}
 	if resp != nil {
 		resp.Request = r

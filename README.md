@@ -1,6 +1,11 @@
-# opencode-cc
+# OpenCode-CC
+
+**Product name:** OpenCode-CC. The executable (`opencode-cc`), config
+directory (`~/.config/opencode-cc`) and service unit (`opencode-cc.service`)
+keep their historical names for drop-in compatibility.
 
 **Optional clients:** [Claude Code and T3 Code setup](docs/setup/OPTIONAL_CLIENTS.md).
+**Five same-account keys / expiry failover:** [credential pool](docs/setup/CREDENTIAL_POOL.md).
 
 **Installing this fork on another laptop? Start with [the complete setup and agent handoff](docs/setup/FRIENDS.md).** It covers the exact Claude → patched CPA → relay → Bun helper chain, optional WARP/phone egress, Telegram recovery, credentials, tests and rollback.
 

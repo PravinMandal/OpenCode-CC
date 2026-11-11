@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
 )
 
 // mockResponsesZen pretends to be Zen's /v1/responses for a Responses-native

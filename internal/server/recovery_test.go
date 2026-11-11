@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 const staleReasoningUpstreamErr = `{"model":"muse-spark-1.3-contributor-free","error":{"param":null,"type":"invalid_request_error","message":"Error from provider (Console): Upstream request failed: [invalid_request_error] reasoning ` +
@@ -232,6 +232,46 @@ func TestPassthroughRetriesInvalidEffort(t *testing.T) {
 	}
 	if seenEfforts[0] != "xhigh" || seenEfforts[1] != "high" {
 		t.Errorf("upstream must see default-clamped xhigh then taught max high: %v", seenEfforts)
+	}
+}
+
+// TestPassthroughRetryDoesNotTruncateLargeSuccess guards the recovery path's
+// second response: peeking a successful response to inspect an error signature
+// buffered the whole body and cut it at 64 KiB, which silently dropped tool
+// calls and stalled long tasks.
+func TestPassthroughRetryDoesNotTruncateLargeSuccess(t *testing.T) {
+	var hits int
+	big := `{"id":"resp_big","object":"response","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` +
+		strings.Repeat("a", 70_000) + `"}]}]}`
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if hits == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, invalidEffortUpstreamErr)
+			return
+		}
+		_, _ = io.WriteString(w, big)
+	})
+	httpSrv := recoveryTestStackWithTarget(t, upstream, "muse-spark-9-test")
+
+	resp, err := http.Post(httpSrv.URL+"/v1/responses", "application/json", strings.NewReader(
+		`{"model":"muse-spark-9-test","stream":false,"reasoning":{"effort":"ultra"},
+		  "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("client must get 200 after clamp+retry, got %d: %s", resp.StatusCode, raw)
+	}
+	if hits != 2 {
+		t.Fatalf("expected exactly 1 retry, got %d", hits)
+	}
+	if len(raw) != len(big) {
+		t.Fatalf("retry response truncated: got %d bytes, want %d", len(raw), len(big))
 	}
 }
 

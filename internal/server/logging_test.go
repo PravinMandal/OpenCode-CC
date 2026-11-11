@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
 )
 
 func TestWithLoggingRecoversAnthropicPanic(t *testing.T) {

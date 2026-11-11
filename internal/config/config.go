@@ -279,11 +279,19 @@ func (c *Config) NextUpstream() (base, key string, ok bool) {
 	}
 	// Atomic round-robin: advance the cursor and pick modulo the pool size.
 	// AddUint64 returns the new value; we use (old+1) % n to spread the first
-	// pick across callers.
+	// pick across callers. If the selected entry's credential cannot be
+	// resolved (expired OAuth, missing env var), walk the rest of the pool
+	// instead of failing the request outright.
 	n := uint64(len(pool))
-	idx := atomic.AddUint64(&c.rr, 1) % n
-	u := pool[idx]
-	return selectedUpstream(u.BaseURL, u.APIKey)
+	start := int(atomic.AddUint64(&c.rr, 1) % n)
+	if base, key, ok := resolvableFrom(pool, start); ok {
+		return base, key, true
+	}
+	// A configured pool that cannot produce a usable credential must fail
+	// closed. Falling back to the legacy single-key field here would silently
+	// reuse a stale key (for example the expired auth.json token) after the
+	// caller deliberately moved to the pool.
+	return "", "", false
 }
 
 // NextUpstreamForKey returns a stable backend for stickyKey. It is used for
@@ -298,8 +306,24 @@ func (c *Config) NextUpstreamForKey(stickyKey string) (base, key string, ok bool
 	if len(pool) == 0 {
 		return legacyUpstream(legacyBase, legacyKey)
 	}
-	u := pool[stickyUpstreamIndex(stickyKey, len(pool))]
-	return selectedUpstream(u.BaseURL, u.APIKey)
+	start := stickyUpstreamIndex(stickyKey, len(pool))
+	if base, key, ok := resolvableFrom(pool, start); ok {
+		return base, key, true
+	}
+	return "", "", false
+}
+
+// resolvableFrom walks the pool starting at start and returns the first entry
+// whose credential can be resolved. It deliberately does not cache failures:
+// a credential file or environment variable can become available later.
+func resolvableFrom(pool []Upstream, start int) (base, key string, ok bool) {
+	for i := 0; i < len(pool); i++ {
+		u := pool[(start+i)%len(pool)]
+		if base, key, ok := selectedUpstream(u.BaseURL, u.APIKey); ok {
+			return base, key, true
+		}
+	}
+	return "", "", false
 }
 
 func (c *Config) usableUpstreams() ([]Upstream, string, string) {
@@ -321,6 +345,44 @@ func legacyUpstream(base, key string) (string, string, bool) {
 		return selectedUpstream(base, key)
 	}
 	return "", "", false
+}
+
+// ResolvedUpstream is one enabled pool entry after credential resolution.
+// Entries whose credential cannot be resolved are omitted.
+type ResolvedUpstream struct {
+	BaseURL string
+	APIKey  string
+}
+
+// ResolvedUpstreams returns the enabled pool in configuration order with each
+// credential resolved. It is used by the auth-failover transport, which needs
+// the same base URL and key pairing the request handlers use.
+func (c *Config) ResolvedUpstreams() []ResolvedUpstream {
+	pool, legacyBase, legacyKey := c.usableUpstreams()
+	if len(pool) == 0 {
+		if base, key, ok := legacyUpstream(legacyBase, legacyKey); ok {
+			return []ResolvedUpstream{{BaseURL: base, APIKey: key}}
+		}
+		return nil
+	}
+	out := make([]ResolvedUpstream, 0, len(pool))
+	seen := make(map[string]bool, len(pool))
+	for _, u := range pool {
+		base, key, ok := selectedUpstream(u.BaseURL, u.APIKey)
+		if !ok {
+			continue
+		}
+		// The same literal key can legitimately appear twice (for example a
+		// key repeated by an older config migration). Keep one copy so a
+		// failover never retries a key it already rejected.
+		sig := base + "\x00" + key
+		if seen[sig] {
+			continue
+		}
+		seen[sig] = true
+		out = append(out, ResolvedUpstream{BaseURL: base, APIKey: key})
+	}
+	return out
 }
 
 func selectedUpstream(base, configuredKey string) (string, string, bool) {

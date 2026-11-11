@@ -1,4 +1,4 @@
-module github.com/Kiowx/opencode-cc
+module github.com/PravinMandal/OpenCode-CC
 
 go 1.24
 

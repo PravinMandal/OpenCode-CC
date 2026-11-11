@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -89,13 +90,20 @@ func ModelsHandler(client *http.Client, upstreamBase, apiKey func() string) http
 // upstream pool, so the base URL and key cannot drift apart between callbacks.
 func ModelsHandlerWithUpstream(client *http.Client, upstream func() (base, apiKey string)) http.HandlerFunc {
 	var (
+		mu       sync.RWMutex
 		cache    []AnthropicModelInfo
 		cachedAt time.Time
 	)
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Serve from cache if fresh (< 60s).
-		if len(cache) > 0 && time.Since(cachedAt) < time.Minute {
-			list := AnthropicModelList{Data: cache, Object: "list", HasMore: false}
+		// Serve a snapshot from cache if fresh (< 60s). The cache is read by
+		// every concurrent client (Claude Code fans out subagents), so the
+		// slice header must not be mutated while another goroutine reads it.
+		mu.RLock()
+		cached := cache
+		at := cachedAt
+		mu.RUnlock()
+		if len(cached) > 0 && time.Since(at) < time.Minute {
+			list := AnthropicModelList{Data: cached, Object: "list", HasMore: false}
 			writeJSON(w, http.StatusOK, list)
 			return
 		}
@@ -108,18 +116,28 @@ func ModelsHandlerWithUpstream(client *http.Client, upstream func() (base, apiKe
 			models, err := fetchZenModels(fetchCtx, client, base, key)
 			cancel()
 			if err == nil && len(models) > 0 {
+				mu.Lock()
 				cache = models
 				cachedAt = time.Now()
+				mu.Unlock()
 			}
 		}
-		if len(cache) == 0 {
+		mu.RLock()
+		list := cache
+		mu.RUnlock()
+		if len(list) == 0 {
 			// Minimal fallback so the endpoint never errors.
-			cache = []AnthropicModelInfo{{
+			list = []AnthropicModelInfo{{
 				ID: "glm-5.1", Type: "model", Object: "model", OwnedBy: "opencode-zen",
 			}}
+			mu.Lock()
+			if len(cache) == 0 {
+				cache = list
+			}
+			mu.Unlock()
 		}
 		writeJSON(w, http.StatusOK, AnthropicModelList{
-			Data: cache, Object: "list", HasMore: false,
+			Data: list, Object: "list", HasMore: false,
 		})
 	}
 }

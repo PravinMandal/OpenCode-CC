@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/store"
+	"github.com/PravinMandal/OpenCode-CC/internal/store"
 )
 
 // TestFailedUpstreamResponseIsKept covers request #30486 (2026-10-23): a 429

@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // bridgeSessionKey returns the sticky key for Zen session headers, falling

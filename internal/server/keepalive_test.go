@@ -10,8 +10,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
 )
+
+// rawHTTPTransport unwraps the credential-failover and free-tier wrappers so
+// transport-level tests can assert the underlying connection pool policy.
+func rawHTTPTransport(tr http.RoundTripper) *http.Transport {
+	switch v := tr.(type) {
+	case *http.Transport:
+		return v
+	case *credentialFailoverTransport:
+		return rawHTTPTransport(v.base)
+	case *nativeTransport:
+		return rawHTTPTransport(v.base)
+	default:
+		return nil
+	}
+}
 
 // TestUpstreamIdleTimeoutKeepsConnectionsWarm locks in the TTFT fix: the
 // shared transport's IdleConnTimeout must be long enough that a request after
@@ -19,8 +34,8 @@ import (
 // TCP+TLS handshake (measured ~610ms of added time-to-first-byte).
 func TestUpstreamIdleTimeoutKeepsConnectionsWarm(t *testing.T) {
 	srv := New(nil, nil)
-	tr, ok := srv.httpClient.Transport.(*http.Transport)
-	if !ok {
+	tr := rawHTTPTransport(srv.httpClient.Transport)
+	if tr == nil {
 		t.Fatalf("expected *http.Transport, got %T", srv.httpClient.Transport)
 	}
 	if tr.IdleConnTimeout < time.Hour {
@@ -51,7 +66,7 @@ func TestKeepAlivePingsReusePooledConnection(t *testing.T) {
 	defer ts.Close()
 
 	srv := New(nil, nil)
-	tr := srv.httpClient.Transport.(*http.Transport)
+	tr := rawHTTPTransport(srv.httpClient.Transport)
 	base := tr.DialContext
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		atomic.AddInt64(&dials, 1)

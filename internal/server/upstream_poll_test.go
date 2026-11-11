@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
 )
 
 // TestRoundRobinUpstreamsAcrossRequests verifies that requests without a

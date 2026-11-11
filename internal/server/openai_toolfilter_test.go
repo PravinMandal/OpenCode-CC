@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kiowx/opencode-cc/internal/config"
-	"github.com/Kiowx/opencode-cc/internal/proxy"
+	"github.com/PravinMandal/OpenCode-CC/internal/config"
+	"github.com/PravinMandal/OpenCode-CC/internal/proxy"
 )
 
 // applyFilter runs one SSE data line through the filter and returns the
