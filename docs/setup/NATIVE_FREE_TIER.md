@@ -163,7 +163,11 @@ but that shape is known to be rejected by the free tier and is not the default.
 
 `BRIDGE_KEEP_DEAD_TOOLS=0` is a debugging escape hatch that restores the old
 pruned shape. Do not set it in production: the free-tier gate fingerprints the
-complete stock tool set, and the pruned shape produced fake quota 429s.
+complete stock tool set, and the pruned shape produced fake quota 429s. With the
+default keep-all shape the sidecar logs `tools_unavailable_noted` (the client
+cannot run a tool, but the tool is still sent); `tools_unavailable_pruned`
+appears only when the kill switch actually removed one and should never be seen
+in production.
 
 The captured system prompt embeds the capture date, so the sidecar substitutes
 today's date at request time; otherwise an identity captured yesterday would be

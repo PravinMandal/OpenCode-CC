@@ -503,7 +503,8 @@ file's contents. Health alone is not acceptance.
 The shape gate means a 200 on the minimal message does not prove the full tool
 surface: the tool task is the real acceptance. If the minimal message passes but
 the tool task returns `FreeUsageLimitError`, check that the sidecar sent the full
-13-tool list (`tools_unavailable_pruned` must not appear) and the exact headers
+13-tool list (`tools_unavailable_pruned` must not appear; only
+`tools_unavailable_noted` is normal) and the exact headers
 before blaming quota.
 
 Keep any monitoring hourly to conserve usage; this repo installs no infinite

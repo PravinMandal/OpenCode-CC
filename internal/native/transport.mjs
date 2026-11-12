@@ -1152,9 +1152,11 @@ function normalize(raw) {
   const prunedCanonical = KEEP_DEAD_TOOLS ? [] : unavailableCanonical;
   const runnableNames = new Set(runnableCanonical.map(toolName));
   if (unavailableCanonical.length) {
+    const pruned = prunedCanonical.map(toolName).slice(0, 8);
     log({
-      event: "tools_unavailable_pruned", model: parsed.model,
-      kept: runnableCanonical.length, pruned: prunedCanonical.map(toolName).slice(0, 8),
+      event: pruned.length ? "tools_unavailable_pruned" : "tools_unavailable_noted",
+      model: parsed.model,
+      kept: runnableCanonical.length, pruned,
       unavailable: unavailableCanonical.map(toolName).slice(0, 8),
     });
     // The canonical prompt is the free-tier fingerprint and must stay intact,
