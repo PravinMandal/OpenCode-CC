@@ -90,6 +90,25 @@ func newNativeTransport(base http.RoundTripper, mgr nativeEndpoint, pool *creden
 	}
 }
 
+// nativeTransportConfigured reports whether the Bun sidecar is part of the
+// deployment, regardless of its current health. When it is configured, a free
+// request must not be rewritten into the Go direct shape just because health
+// is momentarily failing: the direct shape is rejected by the Zen gate, so it
+// reports a quota-shaped 429 for a purely local outage. The request instead
+// goes to the sidecar leg, which returns an explicit 503 when it cannot serve.
+func (s *Server) nativeTransportConfigured() bool {
+	return s != nil && s.native != nil && s.native.Enabled()
+}
+
+// nativeTransportStatus reports the pair exposed on /api/health so a local
+// sidecar outage cannot be mistaken for upstream quota exhaustion.
+func (s *Server) nativeTransportStatus() (configured, ready bool) {
+	if s == nil || s.native == nil {
+		return false, false
+	}
+	return s.native.Enabled(), s.nativeTransportReady()
+}
+
 // nativeTransportReady reports whether the Bun sidecar is currently able to
 // serve free-tier requests. When it is ready, the sidecar supplies the
 // canonical tool set itself, so the Go layer must not inject free-tier marker
@@ -268,7 +287,7 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 				// A full pass over the pool produced no success. If every key
 				// reported a shape failure in this pass, the request itself is
 				// unpassable; surface the real 429 instead of cycling again.
-				if n := t.pool.count(cfgpkg.DefaultUpstreamBase); n > 0 && len(shapeThisPass) >= n {
+				if n := t.pool.countUsable(cfgpkg.DefaultUpstreamBase); n > 0 && len(shapeThisPass) >= n {
 					break
 				}
 				cycles++

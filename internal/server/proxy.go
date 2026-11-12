@@ -107,7 +107,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 			if err != nil {
 				return nil, err
 			}
-			if proxy.IsFreeModel(targetModel) && !s.nativeTransportReady() {
+			if proxy.IsFreeModel(targetModel) && !s.nativeTransportConfigured() {
 				return proxy.PrepareFreeChatBody(b)
 			}
 			return b, nil

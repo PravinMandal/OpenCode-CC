@@ -283,6 +283,21 @@ func TestCredentialPoolNextCyclic(t *testing.T) {
 	}
 }
 
+// TestCredentialPoolCountUsableExcludesDeadAndLimited pins the count the free
+// lane uses to detect a complete pass over the pool. Counting dead or limited
+// keys made "all keys shape-failed" unreachable.
+func TestCredentialPoolCountUsableExcludesDeadAndLimited(t *testing.T) {
+	pool := newCredentialPool(failoverConfig("key-one", "key-two", "key-three"))
+	if got := pool.countUsable(cfgpkg.DefaultUpstreamBase); got != 3 {
+		t.Fatalf("countUsable = %d, want 3", got)
+	}
+	pool.markDead("key-one")
+	pool.markLimited("key-two")
+	if got := pool.countUsable(cfgpkg.DefaultUpstreamBase); got != 1 {
+		t.Fatalf("countUsable = %d, want 1 (only key-three is usable)", got)
+	}
+}
+
 // TestCredentialProbeDoesNotMutatePool keeps warm-up probes from retiring a
 // good key when the probe itself is unauthenticated or rate limited.
 func TestCredentialProbeDoesNotMutatePool(t *testing.T) {

@@ -101,7 +101,7 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		}
 		upstreamStream := in.Stream
 		if proxy.IsFreeModel(targetModel) {
-			if !s.nativeTransportReady() {
+			if !s.nativeTransportConfigured() {
 				upBody, err = proxy.PrepareFreeChatBody(upBody)
 				if err != nil {
 					writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",

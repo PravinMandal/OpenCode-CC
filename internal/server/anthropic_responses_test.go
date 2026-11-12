@@ -258,7 +258,8 @@ func TestBridgeToollessResampleDisabled(t *testing.T) {
 	zen := flakyResponsesZen(t, true, &hits)
 	defer zen.Close()
 	srv := responsesBridgeTestServer(t, zen.URL)
-	// flag left off: faithful relay, single upstream hit.
+	srv.cfg.BridgeToollessResample = false
+	// flag off: faithful relay, single upstream hit.
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(bridgeAnthropicBody(t, true)))

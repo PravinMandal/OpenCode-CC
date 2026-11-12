@@ -190,6 +190,7 @@ func TestChatToollessResampleDisabled(t *testing.T) {
 	zen := flakyChatZen(t, &hits)
 	defer zen.Close()
 	srv, _ := newTestServer(t, zen.URL)
+	srv.cfg.BridgeToollessResample = false
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(chatLoopBody(t)))

@@ -182,7 +182,7 @@ func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool
 		// would make the sidecar believe the client declared shell/read, so a
 		// zero-tool client would keep tools it cannot run. The markers are only
 		// needed on the direct (no-sidecar) fallback path.
-		if !s.nativeTransportReady() {
+		if !s.nativeTransportConfigured() {
 			upBody, err = proxy.PrepareFreeChatBody(upBody)
 			if err != nil {
 				return nil, "", "", false, fmt.Errorf("could not prepare Zen free-tier request: %w", err)

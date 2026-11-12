@@ -64,11 +64,22 @@ func invalidateSessions() {
 type API struct {
 	cfg   *config.Config
 	store *store.Store
+	// nativeProbe reports whether the free-tier sidecar is currently healthy.
+	// nil keeps /api/health's historical schema (no native fields).
+	nativeProbe func() (configured, ready bool)
 }
 
 // New constructs an API.
 func New(cfg *config.Config, st *store.Store) *API {
 	return &API{cfg: cfg, store: st}
+}
+
+// WithNativeProbe lets the server expose free-tier sidecar health on
+// /api/health. A configured-but-unhealthy sidecar is a local outage; without
+// this field it looked like quota exhaustion to anyone watching only health.
+func (a *API) WithNativeProbe(fn func() (configured, ready bool)) *API {
+	a.nativeProbe = fn
+	return a
 }
 
 // Mount registers the API routes on mux under /api.
@@ -152,11 +163,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // health is an unauthenticated liveness probe.
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"ok":      true,
 		"time":    time.Now().Format(time.RFC3339),
 		"version": "1.3.2",
-	})
+	}
+	if a.nativeProbe != nil {
+		configured, ready := a.nativeProbe()
+		payload["native_configured"] = configured
+		payload["native_ready"] = ready
+		if configured && !ready {
+			payload["degraded"] = "free-tier sidecar is configured but unhealthy; free requests return 503 instead of falling back to the non-canonical Go shape"
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // ---------------------------------------------------------------------------

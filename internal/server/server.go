@@ -238,7 +238,7 @@ func (s *Server) Shutdown() error {
 // mountPanelAPI wires the panel's REST API onto mux via the api package.
 func (s *Server) mountPanelAPI(mux *http.ServeMux) {
 	api.SetInvalidateCache(InvalidateKeyCache)
-	api.New(s.cfg, s.store).Mount(mux)
+	api.New(s.cfg, s.store).WithNativeProbe(s.nativeTransportStatus).Mount(mux)
 }
 
 const devPanelPlaceholder = `<!doctype html><meta charset="utf-8">

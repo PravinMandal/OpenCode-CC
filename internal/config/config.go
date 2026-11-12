@@ -19,7 +19,7 @@ import (
 
 // Default values used when nothing else is configured.
 const (
-	DefaultListenAddr      = ":8787"
+	DefaultListenAddr      = "127.0.0.1:8787"
 	DefaultUpstreamBase    = "https://opencode.ai/inference"
 	DefaultDefaultModel    = "glm-4.6"
 	DefaultDataDir         = "data"
@@ -139,7 +139,9 @@ type Config struct {
 	// Chat streams with already-emitted thinking are not resampled because
 	// their reasoning cannot be paired with a different sample's tool calls.
 	// This trades one extra upstream call on tool-less turns for agent loops
-	// that stall on text-only end_turns. Default false.
+	// that stall on text-only end_turns. Default true: a stalled agent turn is
+	// worse than one extra call, and the resample is bounded to short completed
+	// turns. Set false to restore the old behaviour.
 	BridgeToollessResample bool `json:"bridge_toolless_resample"`
 	// ThinkingBudgetMappings are evaluated by target model. They translate
 	// Anthropic thinking budget_tokens into provider-specific request fields.
@@ -197,6 +199,7 @@ func Default() *Config {
 		PromptCacheAnthropicControl: true,
 		PromptCacheNormalize:        true,
 		BridgeDefaultEffort:         "xhigh",
+		BridgeToollessResample:      true,
 		ThinkingBudgetMappings:      DefaultThinkingBudgetMappings(),
 	}
 }

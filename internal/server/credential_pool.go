@@ -241,9 +241,9 @@ func (p *credentialPool) nextCyclic(current, base string) (string, bool) {
 	return "", false
 }
 
-// count returns the number of configured keys for a base. The free lane uses
-// it to recognise a full pass over the pool, including keys that are currently
-// marked dead or limited.
+// count returns the number of configured keys for a base, including keys that
+// are currently marked dead or limited. Diagnostic only; recovery decisions
+// use countUsable.
 func (p *credentialPool) count(base string) int {
 	if p == nil {
 		return 0
@@ -254,6 +254,29 @@ func (p *credentialPool) count(base string) int {
 		if matchesBase(u.BaseURL, base) {
 			n++
 		}
+	}
+	return n
+}
+
+// countUsable returns how many configured keys could actually serve a request
+// right now. A dead or still-limited key will never be attempted by the free
+// lane, so a complete pass is shorter than the raw config count; comparing
+// against the raw count meant "all keys shape-failed" could never trip and the
+// lane kept cycling until the 40-attempt ceiling.
+func (p *credentialPool) countUsable(base string) int {
+	if p == nil {
+		return 0
+	}
+	pool := p.snapshot(false)
+	n := 0
+	for _, u := range pool {
+		if !matchesBase(u.BaseURL, base) {
+			continue
+		}
+		if p.isDead(u.APIKey) || p.isLimited(u.APIKey) {
+			continue
+		}
+		n++
 	}
 	return n
 }
