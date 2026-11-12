@@ -63,13 +63,13 @@ sharing the good lane.
   failures: rotating every key of the same account would hit the same wall and
   hide the real error.
 - **Quota failover:** a `429` marks the key *limited* for 60 seconds (never
-  dead) and retries with the next key. On the free lane the cycle is
-  indefinite: every key is tried with a reset request, the shared reset engine
-  collapses concurrent/recent requests into one radio cycle, and the pool is
-  walked again in cyclic order (`key1 → key2 → … → key5 → key1`) with
-  exponential backoff (5 s, 10 s, 20 s, capped at 30 s). Free-lane retries no
-  longer send `x-bridge-no-reset`; that header only belonged to the old bounded
-  ladder.
+  dead) and retries with the next key. On the free lane the cycle repeats until
+  the request succeeds or a bound is reached: every key is tried with a reset
+  request, the shared reset engine collapses concurrent/recent requests into
+  one radio cycle, and the pool is walked again in cyclic order
+  (`key1 → key2 → … → key5 → key1`) with exponential backoff (5 s, 10 s, 20 s,
+  capped at 30 s). Free-lane retries no longer send `x-bridge-no-reset`; that
+  header only belonged to the old bounded ladder.
 - **Bounded:** a single pass skips dead keys and does not repeat a key until the
   pool wraps. Limited keys stay in the cycle because their 60-second window can
   expire during a pass. The free lane repeats passes until the request

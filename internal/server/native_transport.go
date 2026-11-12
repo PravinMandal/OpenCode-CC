@@ -194,12 +194,13 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// not move and another key is the next step. Do not suppress the reset on
 	// the retry: the quota is IP-wide, and every key must get its own reset
 	// attempt once the reset engine's cooldown expires. Rotation therefore
-	// cycles key 1..N indefinitely rather than stopping after one pass; the
-	// sidecar's reset engine collapses attempts inside its cooldown into one
-	// radio cycle. The loop is bounded by the request context, a wall-clock
-	// budget and a generous attempt ceiling so a pathological upstream cannot
-	// pin the connection forever. Auth failures keep the stricter nextAfter
-	// path: a dead key is not revived by a reset.
+	// cycles key 1..N and repeats the cycle until the request succeeds, the
+	// client cancels, or a bound below expires; the sidecar's reset engine
+	// collapses attempts inside its cooldown into one radio cycle. The loop is
+	// bounded by the request context, a wall-clock budget and a generous
+	// attempt ceiling so a pathological upstream cannot pin the connection
+	// forever. Auth failures keep the stricter nextAfter path: a dead key is
+	// not revived by a reset.
 	started := time.Now()
 	startCredential := credential
 	passSeen := map[string]bool{startCredential: true}
@@ -270,6 +271,7 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 					break
 				}
 				if !sleepContext(r.Context(), delay) {
+					drainAndClose(resp.Body)
 					return nil, r.Context().Err()
 				}
 				passSeen = map[string]bool{next: true}
@@ -281,6 +283,7 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 				break
 			}
 			if err := r.Context().Err(); err != nil {
+				drainAndClose(resp.Body)
 				return nil, err
 			}
 			attempts++

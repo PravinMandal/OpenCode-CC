@@ -786,7 +786,10 @@ func rewriteRawToolCalls(rawCalls json.RawMessage, declared []string, schemas ma
 	for _, call := range calls {
 		var fn map[string]json.RawMessage
 		if json.Unmarshal(call["function"], &fn) != nil {
-			kept = append(kept, call)
+			// A complete response should always carry a function object;
+			// drop the malformed call rather than forwarding a name the
+			// client cannot dispatch.
+			changed = true
 			continue
 		}
 		var name, args, id string

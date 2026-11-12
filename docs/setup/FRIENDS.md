@@ -565,7 +565,7 @@ identities, databases, caches or machine-specific binary backups.
 | HTTP 200 then truncated stream | Read stream to completion; explicit error envelope is a failed generation |
 | Wrong upstream despite env edit | Enabled saved upstream pool takes precedence |
 | Missing UI | Build Vite and copy web/dist to internal/assets/dist **before** go build |
-| Tool name mismatch (`shell` vs `Bash`) | Non-streaming mapping or the sidecar's declared-name resolution; check `tools_resolved`/`tool_call_unresolved` |
+| Tool name mismatch (`shell` vs `Bash`) | Non-streaming mapping or the sidecar's declared-name resolution; look for the `resolved N upstream tool call(s)` log line |
 
 Use `journalctl --user -u opencode-cc --since '10 min ago'` locally; sanitize
 before sharing. Diagnostic probes under `scripts/probe_zen_*` are historical
