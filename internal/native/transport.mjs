@@ -639,9 +639,9 @@ function forgetLease(id) {
   }
 }
 
-function nextLeaseCandidate(exclude) {
+function nextLeaseCandidate(exclude, credentialOverride = "") {
   const now = Date.now();
-  const cred = leaseAccount();
+  const cred = leaseAccount(credentialOverride);
   pruneLeasePool(now);
   const candidates = [];
   for (const [id, rec] of leasePool) {
@@ -1816,7 +1816,7 @@ async function upstream(body, inbound, meta, lease) {
     // 1. Another established id from the pool.
     if (leaseFallbacks < LEASE_FALLBACK_ATTEMPTS) {
       forgetLease(sessionId);
-      const next = nextLeaseCandidate(sessionId);
+      const next = nextLeaseCandidate(sessionId, credentialOverride);
       if (next) {
         leaseFallbacks++;
         log({
