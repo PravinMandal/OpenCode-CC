@@ -644,6 +644,12 @@ If free-tier requests fail again, check these in order:
 | Intermittent `403` after ~12h | session timestamp went stale | the prefix tracks a 12h bucket; check `sessionBucketMillis` |
 | Tool calls die with "tool not found" | phantom marker tool reached the client | see "Phantom marker-tool filtering" above; `chatToolCallFilter` must resolve `shell`/`read` against the declared tool list |
 | Stream chunks silently ignored | SSE framing corrupted by a rewrite | every emitted line must still start with `data:`; `TestRelayPreservesSSEFramingOnRewrite` pins this |
+| `429 FreeUsageLimitError` on a long session, fake ~18h retry-after | conversation-state gate, not quota | check `free_limit_triage`/`x-oc-gate`; the sidecar probes, rebuilds and retries once. Do not rotate keys or the radio |
+| `429` with `x-oc-gate: shape` after repair | request shape unpassable | fix the request shape (system prompt, canonical 13 tools); never cycle keys |
+| `429` with `x-oc-gate: conversation` after rebuild | conversation still gated | start a fresh client session with a handoff; never cycle keys |
+
+The 429 triage probe, shape repair and conversation rebuild are documented in
+[the native free-tier setup](docs/setup/NATIVE_FREE_TIER.md#quota-handling).
 
 `go test ./internal/server/ -run 'TestChatProxy|TestRelayPreservesSSEFraming|TestSynthSessionIDGateShape'`
 covers the session gate, the tool filter, and the SSE framing contract.

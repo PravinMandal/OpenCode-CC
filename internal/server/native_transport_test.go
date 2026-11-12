@@ -211,10 +211,10 @@ func TestNativeFreeLaneCycleIsBounded(t *testing.T) {
 	}
 }
 
-// TestNativeFreeLaneStopsAfterShapePass proves a request shape that is
-// unpassable on every key is surfaced after one real attempt per key instead
-// of cycling the pool (and the radio) for the full attempt ceiling.
-func TestNativeFreeLaneStopsAfterShapePass(t *testing.T) {
+// TestNativeFreeLaneNeverRotatesOnShapeGate proves a request-shape 429 is
+// surfaced after a single attempt on the key that received it. The shape is a
+// property of the request, so trying another API key can only burn quota.
+func TestNativeFreeLaneNeverRotatesOnShapeGate(t *testing.T) {
 	zeroFreeLaneCycleDelays(t)
 	var mu sync.Mutex
 	var creds []string
@@ -223,6 +223,7 @@ func TestNativeFreeLaneStopsAfterShapePass(t *testing.T) {
 		creds = append(creds, r.Header.Get("x-bridge-credential"))
 		mu.Unlock()
 		w.Header().Set("x-oc-reset", "shape")
+		w.Header().Set("x-oc-gate", "shape")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
 	}))
@@ -243,8 +244,45 @@ func TestNativeFreeLaneStopsAfterShapePass(t *testing.T) {
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
-	if len(creds) != 3 {
-		t.Fatalf("credentials = %v, want one attempt per key (3), not a full cycle", creds)
+	if len(creds) != 1 || creds[0] != "key-one" {
+		t.Fatalf("credentials = %v, want exactly [key-one]: shape gate must not rotate keys", creds)
+	}
+}
+
+// TestNativeFreeLaneNeverRotatesOnConversationGate covers the per-conversation
+// fingerprint gate: no other key changes the conversation's history.
+func TestNativeFreeLaneNeverRotatesOnConversationGate(t *testing.T) {
+	zeroFreeLaneCycleDelays(t)
+	var mu sync.Mutex
+	var creds []string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		creds = append(creds, r.Header.Get("x-bridge-credential"))
+		mu.Unlock()
+		w.Header().Set("x-oc-reset", "shape")
+		w.Header().Set("x-oc-gate", "conversation")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+	}))
+	defer sidecar.Close()
+
+	pool := newCredentialPool(failoverConfig("key-one", "key-two", "key-three"))
+	tr := newNativeTransport(&scriptedRoundTripper{}, fakeNativeEndpoint{
+		url: sidecar.URL + "/v1/chat/completions", token: "tok", enable: true,
+	}, pool)
+	req := nativeTestRequest(t)
+	req.Header.Set("Authorization", "Bearer key-one")
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+	if len(creds) != 1 || creds[0] != "key-one" {
+		t.Fatalf("credentials = %v, want exactly [key-one]: conversation gate must not rotate keys", creds)
 	}
 }
 

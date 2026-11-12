@@ -28,7 +28,7 @@ import (
 	"time"
 )
 
-//go:embed transport.mjs capture.mjs
+//go:embed transport.mjs capture.mjs gate.mjs
 var assets embed.FS
 
 // ErrDisabled is returned when the manager has no data directory to stage its
@@ -407,7 +407,7 @@ func (m *Manager) stage() error {
 	if err := os.Chmod(m.identityDir, 0o700); err != nil {
 		return err
 	}
-	for _, name := range []string{"transport.mjs", "capture.mjs"} {
+	for _, name := range []string{"transport.mjs", "capture.mjs", "gate.mjs"} {
 		data, err := assets.ReadFile(name)
 		if err != nil {
 			return err

@@ -26,6 +26,7 @@ import { chmod, readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { classifyGate, compactMessages, shapeRepairable } from "./gate.mjs";
 
 const HOME = homedir();
 const IDENTITY_DIR = process.env.BRIDGE_IDENTITY_DIR || join(HOME, ".local", "share", "opencode-native");
@@ -97,6 +98,30 @@ const PRUNE_TOOL_RESULTS = process.env.BRIDGE_PRUNE_TOOL_RESULTS !== "0";
 const PRUNE_KEEP_RESULTS = Math.max(2, Number(process.env.BRIDGE_PRUNE_KEEP_RESULTS || 8) || 8);
 const PRUNE_PREVIEW_CHARS = Math.max(200, Number(process.env.BRIDGE_PRUNE_PREVIEW_CHARS || 600) || 600);
 const PRUNE_MARKER = "\n\n[opencode-cc: older tool output pruned to fit the free-tier window. Re-run the tool if you need the full result.]";
+// The free-tier gate answers the same generic FreeUsageLimitError for a
+// per-request shape mismatch, a per-conversation state gate, and real quota
+// exhaustion. Triage with a tiny canonical probe on the same key instead of
+// assuming quota and cycling keys / rotating the phone's radio.
+const GATE_PROBE_TIMEOUT_MS = Number(process.env.BRIDGE_GATE_PROBE_TIMEOUT_MS || 20_000);
+const GATE_PROBE_CACHE_MS = Number(process.env.BRIDGE_GATE_PROBE_CACHE_MS || 300_000);
+// How many newest messages survive a conversation rebuild. Cut at a user
+// boundary so an assistant tool_calls block never loses its tool results.
+const GATE_KEEP_MESSAGES = Math.max(8, Number(process.env.BRIDGE_GATE_KEEP_MESSAGES || 40) || 40);
+const GATE_CONVERSATION_CACHE_MS = Number(process.env.BRIDGE_GATE_CONVERSATION_CACHE_MS || 1_800_000);
+// Character budget for a rebuilt conversation (excluding the canonical system
+// prompt and tool schemas). The observed compaction request that the gate
+// rejected carried ~306k characters; 96k leaves room for the stock system and
+// tool definitions while preserving the newest turns.
+const GATE_REBUILD_MAX_CHARS = Math.max(8_000, Number(process.env.BRIDGE_GATE_REBUILD_MAX_CHARS || 96_000) || 96_000);
+const GATE_COMPACT_MARKER = "\n\n[opencode-cc: this part of the earlier tool output was compacted after the upstream free-tier conversation gate. Re-run the tool if you need the full result.]";
+const gateStats = {
+  shape: 0, conversation: 0, quota: 0, unknown: 0,
+  shapeRepairs: 0, conversationRepairs: 0,
+  probePass: 0, probeFail: 0, probeError: 0,
+};
+const gateProbeCache = new Map(); // "cred|model" -> {at, pass}
+const gateProbeInflight = new Map(); // "cred|model" -> Promise<boolean|null>
+const conversationGateCache = new Map(); // conversation key -> {at}
 // Routed models disagree about the prompt-cache field. DeepSeek and GLM accept
 // `prompt_cache_options`; some smaller models reject the whole request with
 // 400 unsupported_parameter. Remember which model rejected it so later turns
@@ -1113,6 +1138,9 @@ function normalize(raw) {
     ...clientSystem.filter(m => !isCanonical(m)),
     ...rest,
   ];
+  // Count only the client's own off-canonical system messages. The dead-tool
+  // note added below is deliberate canonical shape, not a repair target.
+  const clientSystemExtra = clientSystem.filter(m => !isCanonical(m)).length;
 
   // Zen replaced the legacy prompt_cache_retention field with
   // prompt_cache_options. DeepSeek tolerates the old name, but a routed model
@@ -1271,6 +1299,8 @@ function normalize(raw) {
   // tool count, system size, and whether reasoning is being replayed.
   const shape = {
     tools: (parsed.tools || []).length,
+    toolsExtras: extraTools.length,
+    systemExtra: clientSystemExtra,
     messages: parsed.messages.length,
     systemChars: parsed.messages.filter(m => m.role === "system")
       .reduce((n, m) => n + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0),
@@ -1660,7 +1690,7 @@ async function recoverQuota(meta) {
   return await run;
 }
 
-function passThrough429(response, text, reset) {
+function passThrough429(response, text, reset, gate = "") {
   const headers = new Headers({
     "content-type": response.headers.get("content-type") || "application/json",
   });
@@ -1672,8 +1702,144 @@ function passThrough429(response, text, reset) {
   headers.set("x-oc-native", "1");
   headers.set("x-oc-reset", reset);
   headers.set("x-oc-reset-source", RESET_SOURCE);
+  // Go must not rotate API keys for a shape or conversation gate: every key
+  // answers the same 429 because the rejection is about the request or the
+  // conversation, never the credential. Quota 429s carry no gate header and
+  // keep the existing rotation policy.
+  if (gate) headers.set("x-oc-gate", gate);
   return new Response(text, { status: 429, headers });
 }
+
+// ---------------------------------------------------------- free-limit gate
+// Zen answers the same generic FreeUsageLimitError for three unrelated
+// conditions: (a) a request shape its fingerprint does not recognize, (b) a
+// conversation state/length gate, and (c) real quota exhaustion. Treating all
+// three as quota is what cost the T3 thread two repairs: the retry plugin
+// rotated the phone's public IP four times against an answer that no IP change
+// could fix. A minimal canonical probe on the same credential separates them:
+// if the tiny stock-shaped probe passes while the real request is rejected,
+// the answer is (a) or (b), never (c), and no key or egress rotation may run.
+
+function gateProbeCacheKey(meta, credentialOverride) {
+  return `${credentialFingerprint(false, credentialOverride)}|${cleanModelName(meta?.model)}`;
+}
+
+async function probeCanonical(meta, credentialOverride) {
+  const key = gateProbeCacheKey(meta, credentialOverride);
+  const cached = gateProbeCache.get(key);
+  if (cached && Date.now() - cached.at < GATE_PROBE_CACHE_MS) {
+    log({ event: "free_limit_probe_cached", ...meta, pass: cached.pass });
+    return cached.pass;
+  }
+  const running = gateProbeInflight.get(key);
+  if (running) return running;
+  const promise = (async () => {
+    let pass = false;
+    try {
+      // normalize() applies the identical canonical system prompt, full stock
+      // tool list, headers and stream shape used for real traffic, so the probe
+      // tests the fingerprint rather than a hand-written approximation.
+      const probe = normalize(JSON.stringify({
+        model: cleanModelName(meta?.model),
+        stream: false,
+        messages: [{ role: "user", content: "ping" }],
+      }));
+      const response = await fetch(getModelIdentity(meta?.model)?.endpoint || identity.endpoint, {
+        method: "POST",
+        headers: upstreamHeaders(meta?.model, newSessionId(), credentialOverride),
+        body: probe.body,
+        signal: AbortSignal.timeout(GATE_PROBE_TIMEOUT_MS),
+      });
+      pass = response.ok;
+      await response.text().catch(() => {});
+    } catch (error) {
+      gateStats.probeError++;
+      log({ event: "free_limit_probe_error", ...meta, error: String(error?.message || error) });
+      return null; // inconclusive: never proof of quota
+    }
+    if (pass) gateStats.probePass++; else gateStats.probeFail++;
+    gateProbeCache.set(key, { at: Date.now(), pass });
+    if (gateProbeCache.size > 64) gateProbeCache.delete(gateProbeCache.keys().next().value);
+    log({ event: "free_limit_probe", ...meta, pass });
+    return pass;
+  })().finally(() => gateProbeInflight.delete(key));
+  gateProbeInflight.set(key, promise);
+  return promise;
+}
+
+// canonicalizeForGate removes the parts of an already-normalized request that
+// can differ from the stock fingerprint without changing the user's dialogue:
+// a client system message (Claude Code sends its own), extra client tools, and
+// the dead-tool availability note. The canonical system prompt and complete
+// stock tool list remain, because pruning either is itself a fingerprint miss.
+function canonicalizeForGate(rawBody, meta) {
+  let parsed;
+  try { parsed = JSON.parse(rawBody); } catch { return null; }
+  const modelIdent = getModelIdentity(meta?.model) || identity;
+  if (!modelIdent) return null;
+  const canonical = modelIdent.system || identity.system;
+  if (Array.isArray(parsed.messages)) {
+    const rest = parsed.messages.filter(m => m?.role !== "system");
+    parsed.messages = canonical ? [{ role: "system", content: canonical }, ...rest] : rest;
+  }
+  const canonicalTools = modelIdent.tools || identity.tools || [];
+  if (canonicalTools.length) parsed.tools = canonicalTools;
+  else delete parsed.tools;
+  return JSON.stringify(parsed);
+}
+
+// conversationKey identifies the client-visible conversation. It must survive
+// the per-request shape rewriting (extras, pruned tool results) because a
+// conversation gate is about the dialogue, not the tool list.
+function conversationKey(meta, parsed, credentialOverride) {
+  const messages = Array.isArray(parsed?.messages) ? parsed.messages : [];
+  const system = messages.find(m => m?.role === "system");
+  const firstUser = messages.find(m => m?.role === "user");
+  const text = m => typeof m?.content === "string" ? m.content : JSON.stringify(m?.content || "");
+  return sha([
+    credentialFingerprint(false, credentialOverride),
+    cleanModelName(meta?.model),
+    text(system).slice(0, 2000),
+    text(firstUser).slice(0, 2000),
+  ].join("\n"));
+}
+
+// classifyGate (gate.mjs) turns the two recovery outcomes into exactly one
+// class. The probe result is authoritative: a passing probe proves quota is
+// available, so the failure is shape or conversation and never quota.
+
+// rebuildConversation drops the poisoned prefix while preserving a valid
+// tool-call pairing: cut at a user boundary, then drop any leading assistant
+// or tool messages so the request cannot start with an orphaned tool result.
+function rebuildConversation(rawBody) {
+  let parsed;
+  try { parsed = JSON.parse(rawBody); } catch { return null; }
+  if (!Array.isArray(parsed.messages)) return null;
+  const system = parsed.messages.filter(m => m?.role === "system");
+  const rest = parsed.messages.filter(m => m?.role !== "system");
+  let start = Math.max(0, rest.length - GATE_KEEP_MESSAGES);
+  while (start > 0 && rest[start]?.role !== "user") start++;
+  let kept = rest.slice(start);
+  while (kept.length && kept[0]?.role !== "user") kept.shift();
+  if (!kept.length) return null;
+  parsed.messages = [
+    ...system,
+    {
+      role: "user",
+      content: "[opencode-cc] The earlier transcript was compacted after the upstream free-tier conversation gate rejected it. Continue the task from the recent turns below; re-run any tool whose output is missing.",
+    },
+    ...kept,
+  ];
+  // A tool-output-heavy prompt can still exceed the gate after the prefix is
+  // dropped. Compact to a bounded budget, newest turns first, without removing
+  // messages (removal would orphan tool_call_id pairs).
+  const prunedChars = compactMessages(parsed.messages, GATE_REBUILD_MAX_CHARS, GATE_COMPACT_MARKER);
+  if (prunedChars > 0) {
+    log({ event: "free_limit_conversation_compacted", chars: prunedChars, messages: parsed.messages.length });
+  }
+  return JSON.stringify(parsed);
+}
+
 
 // ---------------------------------------------------------------- upstream
 // A non-quota 429 is surfaced untouched. A FreeUsageLimitError from a new
@@ -1697,6 +1863,17 @@ async function upstream(body, inbound, meta, lease) {
   let cacheRepairDone = false;
   let last429 = null;
   let sessionId = lease.id;
+  // Triage state: repair each class at most once per request, then give up
+  // with a precise diagnostic. gateRecovery records which repair saved the
+  // request so a success can be logged and cached.
+  let gateRepairDone = false;
+  let gateRebuildDone = false;
+  let gateRecovery = "";
+  let gateConvKey = "";
+  let gatePreempted = false;
+  try {
+    gateConvKey = conversationKey(meta, JSON.parse(body), credentialOverride);
+  } catch { /* malformed bodies never reach here */ }
   const totalDeadline = Number(meta.started || Date.now()) + HEADER_TIMEOUT + TRANSPORT_RETRY_BUDGET_MS;
   for (let attempt = 1; ; attempt++) {
     await paceStart();
@@ -1713,6 +1890,22 @@ async function upstream(body, inbound, meta, lease) {
     }
     const attemptBudget = remaining > 0 ? remaining : POST_RESET_GRACE_MS;
     postResetGrace = false;
+    // A conversation this process already rebuilt once stays rebuilt for a
+    // while. Otherwise the same poisoned prefix would be re-sent and gated
+    // again on the very next turn, and every turn would pay a probe round trip.
+    if (!gatePreempted && gateConvKey) {
+      gatePreempted = true;
+      const rec = conversationGateCache.get(gateConvKey);
+      if (rec && Date.now() < rec.until) {
+        const rebuilt = rebuildConversation(body);
+        if (rebuilt) {
+          body = rebuilt;
+          sessionId = newSessionId();
+          gateRecovery = "conversation";
+          log({ event: "free_limit_conversation_preempt", ...meta, attempt });
+        }
+      }
+    }
     const controller = new AbortController();
     // The first attempt gets the full header deadline; retries share what is
     // left of the budget. A header timeout is never retried (see catch).
@@ -1792,7 +1985,19 @@ async function upstream(body, inbound, meta, lease) {
       return relayText(text, response);
     }
     if (response.status !== 429) {
-      if (response.ok) markGoodSession(lease.scope, sessionId, credentialOverride);
+      if (response.ok) {
+        markGoodSession(lease.scope, sessionId, credentialOverride);
+        if (gateRecovery) {
+          if (gateRecovery === "shape") gateStats.shapeRepairs++;
+          else if (gateRecovery === "conversation") gateStats.conversationRepairs++;
+          if (gateRecovery === "conversation" && gateConvKey) {
+            conversationGateCache.set(gateConvKey, { at: Date.now(), until: Date.now() + GATE_CONVERSATION_CACHE_MS });
+            if (conversationGateCache.size > 128) conversationGateCache.delete(conversationGateCache.keys().next().value);
+          }
+          log({ event: "free_limit_recovered", ...meta, attempt, gate: gateRecovery });
+          gateRecovery = "";
+        }
+      }
       // Logged after the lease is recorded: an accepted fresh id is leased
       // from this moment on, and calling it "new" sent the last diagnosis
       // looking for a rotation that had not happened.
@@ -1818,6 +2023,52 @@ async function upstream(body, inbound, meta, lease) {
     // cached failure to the active account and last successful egress reset so
     // an account switch or a new IP does not inherit another lane's failure.
     const shapeKey = leaseShapeKey(meta, credentialOverride);
+    const shapeDirty = shapeRepairable(meta?.shape);
+    const probePassed = await probeCanonical(meta, credentialOverride);
+    if (probePassed === null) {
+      gateStats.unknown++;
+      log({ event: "free_limit_triage", ...meta, attempt, class: "unknown" });
+      return passThrough429(response, text, "failed", "unknown");
+    }
+    if (probePassed) {
+      // The credential can still serve a minimal canonical request, so this is
+      // (a) a per-request shape mismatch or (b) a per-conversation state gate.
+      // Never rotate a key or the phone's egress for either.
+      if (shapeDirty && !gateRepairDone) {
+        const repaired = canonicalizeForGate(body, meta);
+        if (repaired) {
+          gateRepairDone = true;
+          gateRecovery = "shape";
+          gateStats.shape++;
+          body = repaired;
+          log({ event: "free_limit_triage", ...meta, attempt, class: "shape", action: "retry_canonical" });
+          continue;
+        }
+      }
+      if (!gateRebuildDone) {
+        const rebuilt = rebuildConversation(body);
+        if (rebuilt) {
+          gateRebuildDone = true;
+          gateRecovery = "conversation";
+          gateStats.conversation++;
+          body = rebuilt;
+          sessionId = newSessionId();
+          log({
+            event: "free_limit_triage", ...meta, attempt,
+            class: classifyGate({ probePassed, shapeRepairPassed: false }),
+            action: "rebuild_conversation", messages: JSON.parse(rebuilt).messages.length,
+          });
+          continue;
+        }
+      }
+      gateStats.conversation++;
+      log({ event: "free_limit_triage", ...meta, attempt, class: "conversation", action: "give_up" });
+      return passThrough429(response, text, "shape", "conversation");
+    }
+    // Probe failed too: this is (c) genuine quota exhaustion. The existing
+    // key-cycle and four-attempt retry policy below is unchanged.
+    gateStats.quota++;
+    log({ event: "free_limit_triage", ...meta, attempt, class: "quota" });
     const blockedAt = shapeFailureAt(shapeKey);
     if (blockedAt) {
       log({ event: "quota_reset_skipped_shape", ...meta, attempt, ageMs: Date.now() - blockedAt });
@@ -1875,6 +2126,9 @@ async function upstream(body, inbound, meta, lease) {
       if (inbound.signal.aborted) return new Response(null, { status: 499 });
       if (outcome.ok) {
         log({ event: "quota_retry", ...meta, attempt, how: outcome.how });
+        // A reset changes the egress, so a probe that failed before it is
+        // stale. The next free-limit 429 must be triaged again, not assumed.
+        gateProbeCache.clear();
         // Give the phone's new route a moment to settle before reusing the pool.
         await Bun.sleep(500);
         // The reset may have finished at the deadline. Allow exactly one
@@ -1943,6 +2197,9 @@ const server = Bun.serve({
           cooldownMs: RESET_COOLDOWN_MS,
           maxRetriesPerRequest: 1,
         },
+        gate: { ...gateStats, probeTimeoutMs: GATE_PROBE_TIMEOUT_MS,
+                conversationCacheMs: GATE_CONVERSATION_CACHE_MS,
+                keepMessages: GATE_KEEP_MESSAGES },
         identity: identity
           ? { version: identity.version, capturedAt: identity.capturedAt,
               systemLen: identity.system.length, tools: identity.tools.length }

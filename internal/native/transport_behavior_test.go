@@ -530,14 +530,14 @@ func TestNativeTransportFallsBackToLeasedSession(t *testing.T) {
 	gotLeased := leased
 	gotSeen := append([]string(nil), seen...)
 	mu.Unlock()
-	if len(gotSeen) != 3 {
-		t.Fatalf("upstream attempts = %v, want initial 200, rejected new id, fallback 200", gotSeen)
+	if len(gotSeen) != 4 {
+		t.Fatalf("upstream attempts = %v, want initial 200, rejected new id, quota probe, fallback 200", gotSeen)
 	}
-	if gotSeen[0] != gotLeased || gotSeen[2] != gotLeased {
+	if gotSeen[0] != gotLeased || gotSeen[3] != gotLeased {
 		t.Fatalf("fallback did not reuse the leased id: leased=%q attempts=%v", gotLeased, gotSeen)
 	}
-	if gotSeen[1] == gotLeased {
-		t.Fatalf("second conversation reused the leased id without a fallback: %v", gotSeen)
+	if gotSeen[1] == gotLeased || gotSeen[2] == gotLeased {
+		t.Fatalf("conversation or probe reused the leased id without a fallback: %v", gotSeen)
 	}
 
 	// The fallback must be remembered, or every later turn of that conversation
@@ -740,13 +740,13 @@ func TestNativeTransportPoolSkipsRejectedFallback(t *testing.T) {
 	mu.Lock()
 	got := append([]string(nil), seen...)
 	mu.Unlock()
-	if len(got) != 3 {
-		t.Fatalf("upstream attempts = %v, want fresh id, rejected pool id A, accepted pool id B", got)
+	if len(got) != 4 {
+		t.Fatalf("upstream attempts = %v, want fresh id, quota probe, rejected pool id A, accepted pool id B", got)
 	}
-	if got[1] != idA || got[2] != idB {
+	if got[2] != idA || got[3] != idB {
 		t.Fatalf("fallback did not walk the pool: %v (A=%s B=%s)", got, idA, idB)
 	}
-	if got[0] == idA || got[0] == idB {
+	if got[0] == idA || got[0] == idB || got[1] == idA || got[1] == idB {
 		t.Fatalf("new scope reused a pooled id without a fallback: %v", got)
 	}
 }
@@ -788,7 +788,7 @@ func TestNativeTransportBoundsLeaseFallbacksBeforeReset(t *testing.T) {
 		seen = append(seen, sid)
 		attempt := len(seen)
 		mu.Unlock()
-		if attempt <= 3 {
+		if attempt <= 4 {
 			writeFreeLimit429(w)
 			return
 		}
@@ -812,11 +812,11 @@ func TestNativeTransportBoundsLeaseFallbacksBeforeReset(t *testing.T) {
 	mu.Lock()
 	got := append([]string(nil), seen...)
 	mu.Unlock()
-	if len(got) != 4 {
-		t.Fatalf("upstream attempts = %v, want initial + 2 lease fallbacks + post-reset retry", got)
+	if len(got) != 5 {
+		t.Fatalf("upstream attempts = %v, want initial + probe + 2 lease fallbacks + post-reset retry", got)
 	}
-	if got[1] != ids[0] || got[2] != ids[1] {
-		t.Fatalf("lease candidates = %v, want only the two oldest before reset", got[1:3])
+	if got[2] != ids[0] || got[3] != ids[1] {
+		t.Fatalf("lease candidates = %v, want only the two oldest before reset", got[2:4])
 	}
 }
 
@@ -952,8 +952,8 @@ func TestNativeTransportResetWaitBoundedByDeadline(t *testing.T) {
 	if elapsed < 900*time.Millisecond {
 		t.Fatalf("reset wait returned in %s; the reset script did not run", elapsed)
 	}
-	if got := hits.Load(); got != requests {
-		t.Fatalf("upstream attempts = %d, want %d", got, requests)
+	if got := hits.Load(); got < requests || got > requests*2 {
+		t.Fatalf("upstream attempts = %d, want %d..%d (each request plus at most one probe)", got, requests, requests*2)
 	}
 }
 
@@ -1136,8 +1136,8 @@ func TestNativeTransportShapeFailureIsScopedToCredential(t *testing.T) {
 	if got := countFileLines(t, resetCount); got != 1 {
 		t.Fatalf("reset invocations after identical shape = %d, want 1", got)
 	}
-	if got := atomic.LoadInt32(&upstreamCalls); got != 4 {
-		t.Fatalf("upstream calls = %d, want 4 (3 ladder attempts + 1 shape probe)", got)
+	if got := atomic.LoadInt32(&upstreamCalls); got != 6 {
+		t.Fatalf("upstream calls = %d, want 6 (initial + quota probe + 2 ladder attempts + post-reset retry + re-probe)", got)
 	}
 
 	// A failed shape under one account must not suppress recovery for another
@@ -1150,8 +1150,8 @@ func TestNativeTransportShapeFailureIsScopedToCredential(t *testing.T) {
 	if got := countFileLines(t, resetCount); got != 2 {
 		t.Fatalf("reset invocations after credential rotation = %d, want 2", got)
 	}
-	if got := atomic.LoadInt32(&upstreamCalls); got != 7 {
-		t.Fatalf("upstream calls after credential rotation = %d, want 7", got)
+	if got := atomic.LoadInt32(&upstreamCalls); got != 10 {
+		t.Fatalf("upstream calls after credential rotation = %d, want 10", got)
 	}
 }
 

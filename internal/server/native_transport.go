@@ -223,6 +223,14 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 				t.pool.markDead(credential)
 			}
 		case http.StatusTooManyRequests:
+			// x-oc-gate is the sidecar's triage verdict: shape/conversation
+			// rejections are about the request, unknown means the probe was
+			// inconclusive. None of them improves with another API key, so
+			// surface the real 429 instead of burning the pool. Only a quota
+			// verdict (no gate header, or "quota") keeps the key cycling.
+			if gate := resp.Header.Get("x-oc-gate"); gate == "shape" || gate == "conversation" || gate == "unknown" {
+				break
+			}
 			// The sidecar sets x-oc-reset when it handled a free-limit 429.
 			// "manual" means it is not a quota response at all; rotating keys
 			// would only hide the real error. "shape" means a reset completed

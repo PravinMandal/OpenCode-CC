@@ -123,7 +123,7 @@ func TestManagerLifecycle(t *testing.T) {
 	}
 
 	// The scripts must be staged where the child can read them.
-	for _, name := range []string{"transport.mjs", "capture.mjs"} {
+	for _, name := range []string{"transport.mjs", "capture.mjs", "gate.mjs"} {
 		if _, err := os.Stat(filepath.Join(dir, "native", name)); err != nil {
 			t.Errorf("staged %s: %v", name, err)
 		}

@@ -245,6 +245,11 @@ All knobs are optional environment variables read by the sidecar:
 | `BRIDGE_LEASE_POOL_LIMIT` | `16` | maximum accepted ids kept in the fallback pool |
 | `BRIDGE_LEASE_FALLBACK_ATTEMPTS` | `2` | pool ids tried before a reset |
 | `BRIDGE_SHAPE_FAILURE_TTL_MS` | `600000` | how long an unpassable request shape skips radio resets |
+| `BRIDGE_GATE_PROBE_TIMEOUT_MS` | `20000` | deadline for the canonical 429 triage probe |
+| `BRIDGE_GATE_PROBE_CACHE_MS` | `300000` | how long a probe verdict is trusted per credential+model |
+| `BRIDGE_GATE_KEEP_MESSAGES` | `40` | newest messages kept by a conversation rebuild |
+| `BRIDGE_GATE_REBUILD_MAX_CHARS` | `96000` | content budget for a rebuilt conversation |
+| `BRIDGE_GATE_CONVERSATION_CACHE_MS` | `1800000` | how long a rebuilt conversation stays rebuilt |
 | `BRIDGE_CAPTURE_MODEL_TIMEOUT_MS` | derived | per-model identity capture timeout |
 | `BRIDGE_RESET_STATE` / `BRIDGE_RESET_LOCK` | the engine defaults | override only for tests |
 | `BRIDGE_NODE` | `node` | interpreter for the reset engine |
@@ -253,26 +258,49 @@ All knobs are optional environment variables read by the sidecar:
 ### Quota handling
 
 A non-quota 429 is returned to the caller as-is. A free-tier
-`FreeUsageLimitError` is ambiguous: it can reflect quota state, account/session
-affinity, or a request rejected by the free-tier gate. The sidecar joins a
-reset already in flight or waits out a foreign lock. The bridge does not claim
-that every successful IP change guarantees quota; the provider does not publish
-enough detail to distinguish these causes from the error body alone.
+`FreeUsageLimitError` is ambiguous: it can reflect genuine quota, a
+per-request shape mismatch, or a per-conversation state gate. The sidecar
+therefore runs a **triage** before any key or egress action:
 
-The Go free lane treats a free-limit 429 as **limited, never dead**, and cycles
-the configured keys:
+1. It sends a minimal canonical probe (`"ping"`) through the same
+   `normalize()` path — stock system prompt, full 13-tool list, stock headers,
+   stream shape — on the same credential with a fresh session id. The result is
+   cached for five minutes per `credential|model` and single-flighted.
+2. If the probe also fails, the class is **quota**. The existing lease
+   fallback, one-egress-reset-per-request, credential rotation and four-attempt
+   policy is unchanged.
+3. If the probe passes and the request carries off-canonical extras (a client
+   system message, `BRIDGE_CLIENT_TOOL_EXTRAS` tools, or a tool list that lost
+   canonical entries), the class is **shape**. The request is rebuilt on the
+   canonical system prompt and the complete canonical tool list, then retried
+   once on the same key.
+4. If the probe passes otherwise, the class is **conversation**. The sidecar
+   rebuilds the dialogue: newest user-bounded window, canonical system prompt,
+   a compaction note, message-content truncation to a 96k-character budget
+   (messages are kept so tool-call pairs stay valid), and a fresh session id.
+   It retries once and caches the conversation for 30 minutes so the next turn
+   does not pay the probe again.
+5. If the probe times out or errors, the class is **unknown** and the real 429
+   is surfaced. An inconclusive probe is never proof of quota.
+
+Recovery is bounded: at most one shape repair and one conversation rebuild per
+request; after that the 429 is surfaced with the precise class. A 429 for
+`shape`, `conversation` or `unknown` must never trigger key cycling or an
+egress reset — neither changes the request or the conversation.
+
+The Go free lane treats only an unclassified free-limit 429 as **limited, never
+dead**, and cycles the configured keys:
 
 1. the request starts on the current key; the sidecar attempts its own
-   recovery (lease fallbacks and one egress reset) for that key;
-2. if the attempt still returns a labeled free-limit 429, the Go layer marks
-   that key limited for 60 seconds and retries with the next key in cyclic
-   order (`key1 → key2 → … → key5 → key1`). A 429 without a free-limit label
-   (for example `x-oc-reset: manual`) is surfaced, because rotating keys would
-   only hide the real error;
-3. every key attempt asks the sidecar to recover, but the shared reset engine
-   is single-flight: requests inside its cooldown join or wait for one radio
-   cycle instead of starting another. "A reset per key" means each key is tried
-   with a reset request, not that five radios cycle for one request;
+   triage (probe, shape repair or conversation rebuild) for that key;
+2. if the attempt still returns a labeled quota 429, the Go layer marks that
+   key limited for 60 seconds and retries with the next key in cyclic order
+   (`key1 → key2 → … → key5 → key1`). A 429 carrying `x-oc-gate: shape`,
+   `conversation` or `unknown` is surfaced immediately;
+3. every quota key attempt asks the sidecar to recover, but the shared reset
+   engine is single-flight: requests inside its cooldown join or wait for one
+   radio cycle instead of starting another. "A reset per key" means each key is
+   tried with a reset request, not that five radios cycle for one request;
 4. after a full pass over the pool, the lane backs off exponentially (5 s,
    10 s, 20 s, capped at 30 s) and starts the next pass. The cycle repeats
    until the request succeeds, its context is cancelled, a 3-minute wall-clock
@@ -292,9 +320,12 @@ The sidecar adds diagnostic headers to a 429:
 
 - `x-oc-native: 1`
 - `x-oc-reset: manual` (non-quota 429), `failed` (reset failed, budget
-  expired, or disabled), `shape` (reset + fresh-id retry still limited; resets
-  are skipped for this shape), or `skipped` (legacy: the caller sent
-  `x-bridge-no-reset`; the current Go lane never does)
+  expired, or disabled), `shape` (request/conversation gate; no egress reset
+  was run), or `skipped` (legacy: the caller sent `x-bridge-no-reset`; the
+  current Go lane never does)
+- `x-oc-gate: shape` (per-request fingerprint mismatch), `conversation`
+  (conversation-state gate), or `unknown` (probe inconclusive). Omitted for
+  genuine quota, which keeps the existing cycle contract.
 - `x-oc-reset-source: opencode-cc`
 - `retry-after` is deliberately **not** forwarded: the upstream value can be
   hours long and would lock local clients out. `x-oc-reset` describes the local
@@ -302,15 +333,15 @@ The sidecar adds diagnostic headers to a 429:
 
 The shape-failure cache is scoped by credential, account, egress and the last
 successful reset time, so a rotated key makes a real attempt and a reset that
-actually changed the egress is retried. The failure is recorded under the
-post-recovery key, so a later pass hits the cache instead of cycling the radio
-again. If every key reports `shape` in one pass, the request itself is
-unpassable; the Go lane surfaces the real 429 immediately.
+actually changed the egress is retried. The probe cache is cleared after a
+successful quota reset, so the next 429 is triaged again rather than inheriting
+the earlier verdict.
 
 `/health` reports `quota.automaticRecovery: true`, the reset source, cooldown,
-and `lease.pool`, `lease.lastGoodAgeMs`, `lease.fallbackAttempts` for diagnosis.
-The engine still owns the radio, the lock, the cooldown and the reset state; the
-sidecar only asks it to act.
+`gate` counters (`shape`, `conversation`, `quota`, `unknown`, repair counts,
+probe pass/fail/error), and `lease.pool`, `lease.lastGoodAgeMs`,
+`lease.fallbackAttempts` for diagnosis. The engine still owns the radio, the
+lock, the cooldown and the reset state; the sidecar only asks it to act.
 
 ## Migration from the fixed-port helper
 
