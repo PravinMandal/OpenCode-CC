@@ -29,9 +29,11 @@ func nativeTestRequest(t *testing.T) *http.Request {
 
 // TestNativeFreeLaneRotatesOn429AfterReset is the free-lane quota contract:
 // the sidecar has already attempted the egress reset (x-oc-reset: failed), so
-// the proxy rotates to the next key, replays the body, and tells the sidecar
-// not to cycle the radio again for that retry.
+// the proxy rotates to the next key and replays the body. The retry must not
+// suppress the reset: quota is IP-wide, so each key gets its own attempt once
+// the engine's cooldown expires.
 func TestNativeFreeLaneRotatesOn429AfterReset(t *testing.T) {
+	zeroFreeLaneCycleDelays(t)
 	var (
 		mu      sync.Mutex
 		creds   []string
@@ -72,8 +74,8 @@ func TestNativeFreeLaneRotatesOn429AfterReset(t *testing.T) {
 	if len(creds) != 2 || creds[0] != "key-one" || creds[1] != "key-two" {
 		t.Fatalf("credentials = %v, want [key-one key-two]", creds)
 	}
-	if len(noReset) != 2 || noReset[0] != "" || noReset[1] != "1" {
-		t.Fatalf("x-bridge-no-reset = %v, want [\"\" \"1\"] (reset once, then rotate only)", noReset)
+	if len(noReset) != 2 || noReset[0] != "" || noReset[1] != "" {
+		t.Fatalf("x-bridge-no-reset = %v, want no suppression: every key attempt may reset", noReset)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != `{"ok":true}` {
@@ -116,9 +118,11 @@ func TestNativeFreeLaneDoesNotRotateOnManual429(t *testing.T) {
 	}
 }
 
-// TestNativeFreeLane429IsBounded proves an exhausted pool stops after one
-// attempt per key instead of looping.
-func TestNativeFreeLane429IsBounded(t *testing.T) {
+// TestNativeFreeLaneCyclesKeysUntilSuccess proves the free lane does not stop
+// after one pass over the pool: a reset may land later, so rotation wraps back
+// to the first key and keeps trying until a key succeeds.
+func TestNativeFreeLaneCyclesKeysUntilSuccess(t *testing.T) {
+	zeroFreeLaneCycleDelays(t)
 	var mu sync.Mutex
 	var creds []string
 	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,9 +130,57 @@ func TestNativeFreeLane429IsBounded(t *testing.T) {
 		creds = append(creds, r.Header.Get("x-bridge-credential"))
 		n := len(creds)
 		mu.Unlock()
+		if n < 5 {
+			w.Header().Set("x-oc-reset", "failed")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer sidecar.Close()
+
+	pool := newCredentialPool(failoverConfig("key-one", "key-two", "key-three"))
+	tr := newNativeTransport(&scriptedRoundTripper{}, fakeNativeEndpoint{
+		url: sidecar.URL + "/v1/chat/completions", token: "tok", enable: true,
+	}, pool)
+	req := nativeTestRequest(t)
+	req.Header.Set("Authorization", "Bearer key-one")
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after the second pass", resp.StatusCode)
+	}
+	want := []string{"key-one", "key-two", "key-three", "key-one", "key-two"}
+	if len(creds) != len(want) {
+		t.Fatalf("credentials = %v, want %v", creds, want)
+	}
+	for i := range want {
+		if creds[i] != want[i] {
+			t.Fatalf("credentials = %v, want %v", creds, want)
+		}
+	}
+}
+
+// TestNativeFreeLaneCycleIsBounded proves a permanently limited upstream
+// cannot pin a request forever: the cycle stops at the attempt ceiling and
+// returns the real 429 rather than looping without end.
+func TestNativeFreeLaneCycleIsBounded(t *testing.T) {
+	zeroFreeLaneCycleDelays(t)
+	var mu sync.Mutex
+	var creds []string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		creds = append(creds, r.Header.Get("x-bridge-credential"))
+		mu.Unlock()
 		w.Header().Set("x-oc-reset", "skipped")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"error":"limited `+string(rune('0'+n))+`"}`)
+		_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
 	}))
 	defer sidecar.Close()
 
@@ -147,7 +199,22 @@ func TestNativeFreeLane429IsBounded(t *testing.T) {
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
-	if len(creds) != 3 {
-		t.Fatalf("credentials = %v, want one attempt per key", creds)
+	if len(creds) != freeLaneMaxAttempts {
+		t.Fatalf("credentials = %d attempts, want %d", len(creds), freeLaneMaxAttempts)
 	}
+	keys := []string{"key-one", "key-two", "key-three"}
+	for i, got := range creds {
+		if want := keys[i%len(keys)]; got != want {
+			t.Fatalf("attempt %d credential = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func zeroFreeLaneCycleDelays(t *testing.T) {
+	t.Helper()
+	oldDelay, oldMax := freeLaneCycleDelay, freeLaneMaxDelay
+	freeLaneCycleDelay, freeLaneMaxDelay = 0, 0
+	t.Cleanup(func() {
+		freeLaneCycleDelay, freeLaneMaxDelay = oldDelay, oldMax
+	})
 }

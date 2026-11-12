@@ -202,6 +202,31 @@ func (p *credentialPool) nextAfter(current, base string) (string, bool) {
 	return "", false
 }
 
+// nextCyclic returns the next key for the free lane's quota cycle. Unlike
+// nextAfter it does not skip limited keys: a free-limit 429 is an IP-wide
+// condition, and the reset the next attempt performs can clear it before the
+// key is retried. Dead keys are still skipped, and reaching the current key
+// again returns it so a single-key deployment keeps retrying instead of
+// stopping after one pass. The caller bounds the cycle by request context.
+func (p *credentialPool) nextCyclic(current, base string) (string, bool) {
+	pool := p.snapshot(true)
+	start := -1
+	for i, u := range pool {
+		if u.APIKey == current {
+			start = i
+			break
+		}
+	}
+	for offset := 1; offset <= len(pool); offset++ {
+		u := pool[(start+offset+len(pool))%len(pool)]
+		if !matchesBase(u.BaseURL, base) || p.isDead(u.APIKey) {
+			continue
+		}
+		return u.APIKey, true
+	}
+	return "", false
+}
+
 // matchesBase reports whether an upstream base is the destination of this
 // request. An empty base matches everything.
 func matchesBase(upstreamBase, requestBase string) bool {

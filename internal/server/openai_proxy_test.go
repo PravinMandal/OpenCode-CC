@@ -118,6 +118,73 @@ func TestOpenAIChatCompletionsNonStream(t *testing.T) {
 	})
 }
 
+// A non-streaming Chat Completions response must map canonical free-lane tool
+// names back to the client's declared names. The upstream (the Bun sidecar for
+// free models) always answers with the canonical 13-tool vocabulary, so a
+// client that declared "Bash" must not receive "shell": Claude Code and other
+// SDKs dispatch strictly by the names they declared.
+func TestOpenAIChatCompletionsNonStreamResolvesCanonicalToolName(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-test",
+			"object":"chat.completion",
+			"model":"glm-5.1",
+			"choices":[{"index":0,"message":{"role":"assistant","content":null,
+				"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"echo hi\"}"}}]},
+				"finish_reason":"tool_calls"}],
+			"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}
+		}`)
+	})
+	_, _, httpSrv := newOpenAITestServer(t, upstream)
+
+	requestBody := `{
+		"model":"client-model",
+		"stream":false,
+		"messages":[{"role":"user","content":"run echo hi"}],
+		"tools":[{"type":"function","function":{"name":"Bash","description":"run a command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+	}`
+	req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/chat/completions", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode response: %v (%s)", err, raw)
+	}
+	if len(out.Choices) != 1 || len(out.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("missing tool call: %s", raw)
+	}
+	call := out.Choices[0].Message.ToolCalls[0]
+	if call.Function.Name != "Bash" {
+		t.Errorf("tool name = %q, want Bash (raw: %s)", call.Function.Name, raw)
+	}
+	if call.ID != "call_1" {
+		t.Errorf("tool call id = %q, want call_1", call.ID)
+	}
+}
+
 func TestPrepareOpenAIRequestSortsTools(t *testing.T) {
 	srv, _, _ := newOpenAITestServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	upBody, incoming, target, stream, err := srv.prepareOpenAIRequest([]byte(`{

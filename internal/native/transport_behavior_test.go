@@ -272,6 +272,15 @@ func upstreamToolNames(body map[string]any) []string {
 	return names
 }
 
+func containsString(list []string, want string) bool {
+	for _, got := range list {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
 func hasSystemNote(body map[string]any) bool {
 	raw, _ := body["messages"].([]any)
 	for _, item := range raw {
@@ -294,7 +303,11 @@ func firstSystem(body map[string]any) string {
 	return text
 }
 
-func TestNativeTransportPrunesDeadTools(t *testing.T) {
+// The free-tier gate fingerprints the complete stock tool set. Sending fewer
+// than all canonical tools makes the request look like an unknown client and
+// returns FreeUsageLimitError while quota remains. Keep every entry even when
+// the client cannot run it, and tell the model which ones are unavailable.
+func TestNativeTransportKeepsCanonicalToolsForFingerprint(t *testing.T) {
 	bun := testBun(t)
 	srv, cap := newFakeUpstream(t)
 	dir := t.TempDir()
@@ -308,18 +321,37 @@ func TestNativeTransportPrunesDeadTools(t *testing.T) {
 	sidecarRequest(t, s.port, "primary-model", tools(client...))
 	body := upstreamBody(t, cap)
 	names := upstreamToolNames(body)
-	if len(names) != 11 {
-		t.Fatalf("tools = %v, want 11 runnable canonical tools", names)
+	if len(names) != len(canonical) {
+		t.Fatalf("tools = %v, want all %d canonical tools", names, len(canonical))
 	}
-	for _, dead := range []string{"execute", "experimental_image_generate"} {
-		for _, name := range names {
-			if name == dead {
-				t.Fatalf("dead tool %q reached upstream: %v", dead, names)
-			}
+	for _, want := range canonical {
+		if !containsString(names, want) {
+			t.Fatalf("canonical tool %q missing from %v", want, names)
 		}
 	}
 	if !hasSystemNote(body) {
 		t.Fatalf("missing unavailable-tools note: %#v", body["messages"])
+	}
+}
+
+// BRIDGE_KEEP_DEAD_TOOLS=0 keeps the old pruned shape available for debugging
+// a future gate change without a rebuild.
+func TestNativeTransportDeadToolPruningEscapeHatch(t *testing.T) {
+	bun := testBun(t)
+	srv, cap := newFakeUpstream(t)
+	dir := t.TempDir()
+	canonical := []string{"shell", "read", "write", "edit", "glob", "grep", "webfetch",
+		"websearch", "skill", "subagent", "question", "execute", "experimental_image_generate"}
+	writeIdentity(t, dir, srv.URL, canonical)
+	s := startSidecar(t, bun, dir, "BRIDGE_KEEP_DEAD_TOOLS=0")
+
+	sidecarRequest(t, s.port, "primary-model", tools("Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Skill", "Agent", "AskUserQuestion"))
+	body := upstreamBody(t, cap)
+	names := upstreamToolNames(body)
+	for _, dead := range []string{"execute", "experimental_image_generate"} {
+		if containsString(names, dead) {
+			t.Fatalf("dead tool %q reached upstream in prune mode: %v", dead, names)
+		}
 	}
 }
 
@@ -348,7 +380,7 @@ func TestNativeTransportShellFallbackAliases(t *testing.T) {
 	canonical := []string{"shell", "read", "write", "edit", "glob", "grep", "webfetch",
 		"websearch", "skill", "subagent", "question", "execute", "experimental_image_generate"}
 	writeIdentity(t, dir, srv.URL, canonical)
-	s := startSidecar(t, bun, dir)
+	s := startSidecar(t, bun, dir, "BRIDGE_KEEP_DEAD_TOOLS=0")
 
 	// Codex-style client: only exec_command. The shell fallbacks are runnable
 	// through it; skill/subagent/question/execute/image are not.
@@ -372,7 +404,9 @@ func TestNativeTransportEmptyToolListIsOmitted(t *testing.T) {
 	srv, cap := newFakeUpstream(t)
 	dir := t.TempDir()
 	writeIdentity(t, dir, srv.URL, []string{"shell", "read"})
-	s := startSidecar(t, bun, dir)
+	// Escape-hatch shape only: the default always sends the canonical set
+	// because the free-tier fingerprint rejects a missing tool.
+	s := startSidecar(t, bun, dir, "BRIDGE_KEEP_DEAD_TOOLS=0")
 
 	sidecarRequest(t, s.port, "primary-model", tools("mcp__x__read"))
 	body := upstreamBody(t, cap)
@@ -1181,7 +1215,7 @@ func TestNativeTransportDropsPrunedToolChoice(t *testing.T) {
 	srv, cap := newFakeUpstream(t)
 	dir := t.TempDir()
 	writeIdentity(t, dir, srv.URL, []string{"shell", "read", "execute"})
-	s := startSidecar(t, bun, dir)
+	s := startSidecar(t, bun, dir, "BRIDGE_KEEP_DEAD_TOOLS=0")
 
 	status, _, body := sidecarRequestFull(t, s.port, "primary-model", tools("Bash"), nil,
 		map[string]any{

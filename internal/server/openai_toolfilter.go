@@ -698,6 +698,129 @@ func setToolCallName(call map[string]json.RawMessage, name string) bool {
 	return true
 }
 
+// filterUndeclaredOpenAIToolsRaw rewrites canonical tool names in a complete
+// (non-streaming) Chat Completions response to the names the client declared.
+// The streaming lane resolves every delta; without this a free-lane response
+// carries "shell" while a client that declared "Bash" dispatches only its own
+// names and silently never runs the call. Only the affected fields are
+// re-encoded, so provider-specific response fields survive untouched.
+func filterUndeclaredOpenAIToolsRaw(raw, reqBody []byte) []byte {
+	declared := declaredOpenAIToolNames(reqBody)
+	if len(declared) == 0 {
+		return raw
+	}
+	schemas := declaredOpenAIToolSchemas(reqBody)
+
+	var top map[string]json.RawMessage
+	if json.Unmarshal(raw, &top) != nil {
+		return raw
+	}
+	var choices []map[string]json.RawMessage
+	if json.Unmarshal(top["choices"], &choices) != nil {
+		return raw
+	}
+	changed := false
+	for i := range choices {
+		rawMessage, ok := choices[i]["message"]
+		if !ok {
+			continue
+		}
+		var message map[string]json.RawMessage
+		if json.Unmarshal(rawMessage, &message) != nil {
+			continue
+		}
+		calls, callsChanged, allDropped := rewriteRawToolCalls(message["tool_calls"], declared, schemas)
+		if !callsChanged {
+			continue
+		}
+		changed = true
+		if allDropped {
+			delete(message, "tool_calls")
+			if reason, ok := choices[i]["finish_reason"]; ok {
+				var fr string
+				if json.Unmarshal(reason, &fr) == nil && fr == "tool_calls" {
+					choices[i]["finish_reason"] = json.RawMessage(`"stop"`)
+				}
+			}
+		} else {
+			encoded, err := json.Marshal(calls)
+			if err != nil {
+				continue
+			}
+			message["tool_calls"] = encoded
+		}
+		encodedMessage, err := json.Marshal(message)
+		if err != nil {
+			continue
+		}
+		choices[i]["message"] = encodedMessage
+	}
+	if !changed {
+		return raw
+	}
+	encodedChoices, err := json.Marshal(choices)
+	if err != nil {
+		return raw
+	}
+	top["choices"] = encodedChoices
+	out, err := json.Marshal(top)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// rewriteRawToolCalls resolves every call in a raw tool_calls array. It
+// returns the kept calls, whether anything changed, and whether every call
+// was dropped as undeclared.
+func rewriteRawToolCalls(rawCalls json.RawMessage, declared []string, schemas map[string]json.RawMessage) ([]map[string]json.RawMessage, bool, bool) {
+	if len(rawCalls) == 0 {
+		return nil, false, false
+	}
+	var calls []map[string]json.RawMessage
+	if json.Unmarshal(rawCalls, &calls) != nil || len(calls) == 0 {
+		return nil, false, false
+	}
+	kept := calls[:0]
+	changed := false
+	for _, call := range calls {
+		var fn map[string]json.RawMessage
+		if json.Unmarshal(call["function"], &fn) != nil {
+			kept = append(kept, call)
+			continue
+		}
+		var name, args, id string
+		_ = json.Unmarshal(fn["name"], &name)
+		_ = json.Unmarshal(fn["arguments"], &args)
+		_ = json.Unmarshal(call["id"], &id)
+		resolved, translated, ok := proxy.ResolveDeclaredCallWithSchemas(name, args, declared, schemas)
+		if !ok {
+			changed = true
+			continue
+		}
+		if resolved != name || translated != args {
+			proxy.RememberTranslatedCall(id, name, args, resolved, translated)
+			encodedName, nameErr := json.Marshal(resolved)
+			encodedArgs, argsErr := json.Marshal(translated)
+			if nameErr != nil || argsErr != nil {
+				kept = append(kept, call)
+				continue
+			}
+			fn["name"] = encodedName
+			fn["arguments"] = encodedArgs
+			encodedFn, err := json.Marshal(fn)
+			if err != nil {
+				kept = append(kept, call)
+				continue
+			}
+			call["function"] = encodedFn
+			changed = true
+		}
+		kept = append(kept, call)
+	}
+	return kept, changed, len(kept) == 0
+}
+
 // declaredOpenAIToolNames extracts the function names a client declared on a
 // Chat Completions request.
 func declaredOpenAIToolNames(body []byte) []string {

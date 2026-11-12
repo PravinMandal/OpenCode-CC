@@ -113,10 +113,10 @@
   credential-related, including a workspace denial, marks that key dead for
   five minutes and replays the request with the next key; a quota/billing 403
   is surfaced instead. A `429` marks the key *limited* for 60 seconds and
-  rotates as the **last resort**, after the free-tier sidecar has attempted its
-  egress reset for that request (`x-bridge-no-reset` stops later keys from
-  cycling the radio again). Failover is bounded by the pool size and always
-  returns the real upstream error.
+  rotates to the next key. On the free lane every key gets its own egress-reset
+  attempt and the pool is cycled indefinitely (`key1 → … → key5 → key1`) with
+  5–30 s backoff, bounded by the request context and a 40-attempt safety
+  ceiling. The old `x-bridge-no-reset` header is no longer sent.
 - A key from a different account must not inherit the captured account's
   workspace header or session lease. The sidecar learns the mismatch from the
   first `403 Workspace access denied`, drops `x-opencode-org-id` /
@@ -166,10 +166,11 @@
   translates each call back to the client's tool name and arguments. A
   non-quota 429 is returned as-is. The generic `FreeUsageLimitError` does not
   disclose whether quota, account/session affinity, or request shape was
-  rejected. Recovery tries at most two accepted session IDs, then may invoke
-  the shared `request-reset.mjs` engine once (`--source=opencode-cc`,
-  `RESET_ALLOW_AUTOMATIC=1`) and retry. Never probe the budget, rotate the
-  egress yourself, or retry in an unbounded loop.
+  rejected. Recovery within one sidecar attempt tries at most two accepted
+  session IDs, then may invoke the shared `request-reset.mjs` engine once
+  (`--source=opencode-cc`, `RESET_ALLOW_AUTOMATIC=1`) and retry. The Go free
+  lane may then rotate keys and repeat passes (see the key-pool bullet).
+  Never probe the budget or rotate the egress outside that engine.
 - OpenCode CLI and T3 OpenCode stay direct to opencode.ai. CPA fronts Claude,
   Codex, Antigravity and LFM3 only. CPA has exactly one `opencode-cc` Claude
   provider, and both free aliases (`oc/...`) live on it.

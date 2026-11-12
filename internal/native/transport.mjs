@@ -73,10 +73,13 @@ const MIN_START_GAP_MS = Number(process.env.BRIDGE_MIN_START_GAP_MS || 400);
 // Skill, plus argument keys). Set BRIDGE_CLIENT_TOOL_EXTRAS=1 only to
 // experiment with a model whose gate is known to accept extras.
 const CLIENT_TOOL_EXTRAS = process.env.BRIDGE_CLIENT_TOOL_EXTRAS === "1";
-// Keep the full canonical tool set even when the client cannot run a tool.
-// Escape hatch for the free-tier shape gate: if a shorter prefix is rejected,
-// set this to 1 and the client note alone discourages the dead call.
-const KEEP_DEAD_TOOLS = process.env.BRIDGE_KEEP_DEAD_TOOLS === "1";
+// The free-tier gate fingerprints the *entire* stock toolset. Pruning even one
+// tool the client cannot run makes the request look like an unknown client and
+// returns FreeUsageLimitError with quota still available. Send all canonical
+// tools always; the client note below tells the model which are unavailable,
+// and the Go layer turns a dead call into a tool error instead of dropping the
+// turn. BRIDGE_KEEP_DEAD_TOOLS=0 remains only as a debugging escape hatch.
+const KEEP_DEAD_TOOLS = process.env.BRIDGE_KEEP_DEAD_TOOLS !== "0";
 // The canonical <env> block names the directory capture.mjs ran in. Rewriting
 // it to the client's real working directory keeps the prompt truthful. Set
 // BRIDGE_REWRITE_ENV=0 to ship the captured block untouched.
@@ -1127,13 +1130,15 @@ function normalize(raw) {
   // shell/read/skill call is rewritten to the client's Bash/Read/Skill.
   const canonicalTools = modelIdent.tools || identity.tools || [];
   const canonicalNames = new Set(canonicalTools.map(toolName));
-  // A canonical tool the client cannot run is a trap: the model calls it, the
-  // Go layer has no declared target, and the turn ends with a dropped-call
-  // notice. Drop every dead entry, not just the trailing suffix: keeping a
-  // dead tool in the middle (experimental_image_generate) leaves it callable
-  // while the note below says it is unavailable. BRIDGE_KEEP_DEAD_TOOLS=1
-  // restores the stock list if a gate check ever proves the pruned shape is
-  // rejected.
+  // A canonical tool the client cannot run is a trap in the other direction:
+  // the model calls it, the Go layer has no declared target, and the turn ends
+  // with a dropped-call notice. By default every canonical tool is still sent
+  // because the free-tier gate fingerprints the complete stock tool set;
+  // pruning even one entry is what produced fake FreeUsageLimitError 429s. The
+  // note below tells the model which entries are unavailable, and the Go layer
+  // turns a dead call into a tool error instead of dropping the turn.
+  // BRIDGE_KEEP_DEAD_TOOLS=0 is a debugging escape hatch that restores the old
+  // pruned shape.
   const clientToolNames = new Set(
     (parsed.tools || []).map(toolName).map(shortToolName).filter(Boolean));
   const runnableFlags = canonicalTools.map(t => clientCanRun(toolName(t), clientToolNames));

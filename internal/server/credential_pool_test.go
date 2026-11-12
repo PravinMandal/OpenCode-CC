@@ -257,6 +257,32 @@ func TestCredentialFailoverLimitedKeyRecovers(t *testing.T) {
 	resp.Body.Close()
 }
 
+// TestCredentialPoolNextCyclic covers the free-lane rotation contract: limited
+// keys stay in the cycle (a new egress can clear them), dead keys are skipped,
+// and a single-key pool returns that key so it can retry after a reset.
+func TestCredentialPoolNextCyclic(t *testing.T) {
+	pool := newCredentialPool(failoverConfig("key-one", "key-two"))
+	pool.markLimited("key-one")
+	next, ok := pool.nextCyclic("key-two", cfgpkg.DefaultUpstreamBase)
+	if !ok || next != "key-one" {
+		t.Fatalf("nextCyclic = %q, %v; want limited key-one back in the cycle", next, ok)
+	}
+	pool.markDead("key-one")
+	next, ok = pool.nextCyclic("key-two", cfgpkg.DefaultUpstreamBase)
+	if !ok || next != "key-two" {
+		t.Fatalf("nextCyclic = %q, %v; want the only live key", next, ok)
+	}
+	single := newCredentialPool(failoverConfig("only"))
+	next, ok = single.nextCyclic("only", cfgpkg.DefaultUpstreamBase)
+	if !ok || next != "only" {
+		t.Fatalf("single-key nextCyclic = %q, %v; want only", next, ok)
+	}
+	single.markDead("only")
+	if _, ok := single.nextCyclic("only", cfgpkg.DefaultUpstreamBase); ok {
+		t.Fatal("dead-only pool must not return a key")
+	}
+}
+
 // TestCredentialProbeDoesNotMutatePool keeps warm-up probes from retiring a
 // good key when the probe itself is unauthenticated or rate limited.
 func TestCredentialProbeDoesNotMutatePool(t *testing.T) {

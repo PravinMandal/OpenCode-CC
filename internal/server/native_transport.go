@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +28,32 @@ import (
 type nativeEndpoint interface {
 	Enabled() bool
 	Endpoint() (string, string, error)
+}
+
+// Free-lane quota cycling. A free-limit 429 is an IP-wide condition, so the
+// lane resets the egress through the sidecar and then moves through every key
+// in the pool, wrapping back to the first and repeating. These are variables
+// so tests can shrink the delays; the attempt ceiling is a safety valve for a
+// pathological upstream (a client that disconnects cancels the request
+// immediately and ends the loop).
+var (
+	freeLaneMaxAttempts = 40
+	freeLaneCycleDelay  = 5 * time.Second
+	freeLaneMaxDelay    = 30 * time.Second
+)
+
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 type nativeTransport struct {
@@ -161,13 +188,22 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nativeUnavailable(r, err), nil
 	}
 	// A rejected key is recoverable without changing request shape. A 429 is
-	// recoverable by rotation too, but only as the last resort: by the time the
-	// sidecar surfaces one it has already attempted the egress reset for this
-	// request. Retries therefore carry x-bridge-no-reset so rotating through
-	// the whole pool never cycles the phone's radio once per key. nextAfter
-	// skips every key already dead or limited, so this loop is bounded by the
-	// pool size and always surfaces the real upstream error.
+	// recoverable by rotation too. The sidecar attempts an egress reset before
+	// it surfaces a free-limit 429, so a failed reset means the IP bucket did
+	// not move and another key is the next step. Do not suppress the reset on
+	// the retry: the quota is IP-wide, and every key must get its own reset
+	// attempt once the reset engine's cooldown expires. Rotation therefore
+	// cycles key 1..N indefinitely rather than stopping after one pass; the
+	// sidecar's reset engine collapses attempts inside its cooldown into one
+	// radio cycle. The loop is bounded by the request context and a generous
+	// attempt ceiling so a pathological upstream cannot pin the connection
+	// forever. Auth failures keep the stricter nextAfter path: a dead key is
+	// not revived by a reset.
+	startCredential := credential
+	cycles := 0
+	attempts := 0
 	for resp != nil && t.pool != nil && credential != "" {
+		quota := false
 		rotatable := false
 		switch resp.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
@@ -179,28 +215,63 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		case http.StatusTooManyRequests:
 			// The sidecar sets x-oc-reset when it handled a free-limit 429.
 			// "manual" means it is not a quota response at all; rotating keys
-			// would only hide the real error.
+			// would only hide the real error. "shape" means a reset completed
+			// but a fresh egress still returned the limit: the shape cache is
+			// key-scoped and expires, so keep it in the quota cycle for a
+			// later reset attempt instead of treating it as terminal.
 			switch resp.Header.Get("x-oc-reset") {
 			case "failed", "shape", "skipped":
 				t.pool.markLimited(credential)
-				rotatable = true
+				rotatable, quota = true, true
 			}
 		}
 		if !rotatable {
 			break
 		}
-		next, ok := t.pool.nextAfter(credential, cfgpkg.DefaultUpstreamBase)
+		var next string
+		var ok bool
+		if quota {
+			if attempts+1 >= freeLaneMaxAttempts {
+				break
+			}
+			next, ok = t.pool.nextCyclic(credential, cfgpkg.DefaultUpstreamBase)
+		} else {
+			next, ok = t.pool.nextAfter(credential, cfgpkg.DefaultUpstreamBase)
+		}
 		if !ok {
 			break
 		}
 		drainAndClose(resp.Body)
+		if quota {
+			attempts++
+			if next == startCredential {
+				// A full pass over the pool produced no success. Back off so
+				// the next pass starts after the reset cooldown and can
+				// actually rotate the egress instead of replaying a cached
+				// rejection.
+				cycles++
+				delay := freeLaneCycleDelay * time.Duration(cycles)
+				if delay > freeLaneMaxDelay {
+					delay = freeLaneMaxDelay
+				}
+				if !sleepContext(r.Context(), delay) {
+					return nil, r.Context().Err()
+				}
+			}
+			if err := r.Context().Err(); err != nil {
+				return nil, err
+			}
+		}
 		body, bodyErr := r.GetBody()
 		if bodyErr != nil {
 			break
 		}
 		local.Body = body
 		local.Header.Set("x-bridge-credential", next)
-		local.Header.Set("x-bridge-no-reset", "1")
+		// Every attempt (including a rotated key) may reset the egress: the
+		// previous attempt's reset either failed or was too recent, and the
+		// sidecar's cooldown decides whether a new radio cycle is needed.
+		local.Header.Del("x-bridge-no-reset")
 		credential = next
 		resp, err = t.local.RoundTrip(local)
 		if err != nil {

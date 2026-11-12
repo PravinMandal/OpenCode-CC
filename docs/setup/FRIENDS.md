@@ -182,74 +182,55 @@ different credential: it is not evidence of the active v2 identity. Never copy
 refresh tokens or write its credential database. A static Zen key avoids that
 refresh dependency but still has the account's real permissions and limits.
 
-## 4. Install the DS Bun helper
+## 4. Install Bun for the native free-tier sidecar
 
-The helper intercepts **only** POST Chat requests for
-`deepseek-v4.1-flash-free` on the allowed `https://opencode.ai` inference/Zen
-paths. Other models and origins use the existing Go transport. It is not a
-standalone account/model router.
+The free-tier transport is a Bun sidecar embedded in `opencode-cc`
+(`internal/native/transport.mjs` + `capture.mjs`). There is **no separate
+service and no fixed port**: the proxy extracts the scripts to a private temp
+directory, starts Bun on an ephemeral loopback port, and supervises it. All
+`-free` models and `big-pickle` route through it.
 
-Install Bun from its [official installation instructions](https://bun.sh/docs/installation),
-verify the download and `bun --version`. Production here uses **1.4.2**; its
-Linux x64 baseline archive checksum and provenance are in the helper README.
-That checksum is not valid for ARM or other archives. Do not blindly install
-whatever latest release happens to be available and call it the same runtime.
+Bun is still a runtime dependency. Install it from the
+[official instructions](https://bun.sh/docs/installation) and verify the
+version. Production here uses **1.4.2**; do not assume another release has the
+same behavior. Put the verified executable where the proxy looks first:
 
 ```bash
-# Set this to the verified executable, not a directory.
 BUN_BIN="$HOME/.bun/bin/bun"
 "$BUN_BIN" --version
-"$BUN_BIN" test scripts/ds-flash-gateway/gateway.test.mjs
-release_name="$(date -u +%Y%m%dT%H%M%SZ)"
-release_root="$HOME/.local/lib/opencode-cc-ds-flash"
-install -d "$release_root/releases/$release_name"
-cp scripts/ds-flash-gateway/{gateway.mjs,system.txt,manifest.json,LICENSE} "$release_root/releases/$release_name/"
-install -m 755 "$BUN_BIN" "$release_root/releases/$release_name/bun"
-ln -s "releases/$release_name" "$release_root/current.new"
-mv -Tf "$release_root/current.new" "$release_root/current"
-install -m 644 scripts/ds-flash-gateway/opencode-cc-ds-flash.service "$HOME/.config/systemd/user/"
-install -d "$HOME/.config/systemd/user/opencode-cc-ds-flash.service.d"
+install -d "$HOME/.local/lib/opencode-native"
+install -m 755 "$BUN_BIN" "$HOME/.local/lib/opencode-native/bun"
 ```
 
-The supplied unit records Wraient's production settings (`phone,direct`, auto
-reset enabled). **Before first start on a friend's laptop**, create
-`~/.config/systemd/user/opencode-cc-ds-flash.service.d/local.conf`:
+`OPENCODE_CC_BUN=/path/to/bun` overrides discovery; otherwise the proxy checks
+`~/.local/lib/opencode-native/bun`, then `PATH`, `/usr/local/bin/bun` and
+`/usr/bin/bun`. The old `opencode-cc-ds-flash.service`, `opencode-native.service`
+and `:18790` listener are retired; do not install them.
 
-```ini
-[Service]
-Environment=DS_FLASH_ROUTES=direct
-Environment=DS_FLASH_AUTO_RESET=0
-```
+What the sidecar does, and why it must not be "optimized":
 
-This starts with a working, independent local route and does not assume a phone
-or send Telegram messages. Section 7 explains when to enable the full setup.
+- replaces the client's prompt with the exact captured stock OpenCode system
+  prompt (only the `Today's date:` line is refreshed);
+- always sends the complete captured **13-tool** canonical list — `edit`,
+  `glob`, `grep`, `read`, `shell`, `skill`, `subagent`, `webfetch`,
+  `websearch`, `write`, `execute`, `question`,
+  `experimental_image_generate`;
+- sends `User-Agent: opencode/latest/2.2.7/cli` and
+  `X-Opencode-Client: cli`;
+- maps canonical tool calls back to the client's declared names and argument
+  keys (`shell`→`Bash`, `read`→`Read`, `path`→`file_path`, …);
+- keeps sessions on a key-scoped lease so one account's session id is never
+  replayed with another account's key, and drops
+  `x-opencode-org-id`/`x-opencode-workspace-id` when a key belongs to a
+  different workspace;
+- on a 429, joins or starts one shared egress reset per attempt; the Go layer
+  then cycles keys (`key1 → … → key5 → key1`) with 5–30 s backoff until the
+  request succeeds, its context is cancelled, or a 40-attempt safety ceiling
+  is reached.
 
-```bash
-install -d "$HOME/.config/systemd/user/opencode-cc.service.d"
-install -m 644 scripts/ds-flash-gateway/opencode-cc-dropin.conf "$HOME/.config/systemd/user/opencode-cc.service.d/ds-flash.conf"
-systemctl --user daemon-reload
-systemctl --user enable --now opencode-cc-ds-flash opencode-cc
-curl --noproxy '*' -fsS http://127.0.0.1:18790/health
-curl --noproxy '*' -fsS http://127.0.0.1:8787/api/health
-```
-
-The helper adds a pinned OpenCode prelude (about 2–3K context tokens), consolidates
-text system messages, and retains client instructions, tool schemas/history,
-limits and reasoning fields. Its prelude's public tool catalog does not register
-or execute those tools. Session affinity is scoped by authorization + incoming
-session; metadata timestamps refresh after four minutes. This is observed
-compatibility behavior, not a provider-supported free-client contract.
-
-It tries the preferred route, then the other configured route for a connection
-failure or known `FreeUsageLimitError`. A successful route becomes preferred.
-401/403 and other 429s pass through. All-route quota failure preserves the
-upstream response and Retry-After. It does not replace accounts/models or create
-allowance. Header acquisition is bounded to 30 seconds per route; a healthy
-stream can continue longer. Body limit is 8 MiB. The eight-request admission
-counter covers header acquisition, **not eight guaranteed active-generation
-slots**. Bun idle timeout is 255 seconds; other upstream/client limits still
-apply. Late SSE disconnects become explicit API errors, choose the alternate
-route for the next attempt, and do not replay partial text/tool calls internally.
+The full contract, env table and diagnostics are in
+[`NATIVE_FREE_TIER.md`](NATIVE_FREE_TIER.md). A new install needs only Bun and
+the proxy; no drop-in for a separate helper is required.
 
 ## 5. CPA: the local patches are required for the exact recovery behavior
 
@@ -345,12 +326,13 @@ its proxy env therefore did not establish that Zen used WARP. Inspect the
 environment or the env file alone may differ from the process until restart.
 Go's environment proxy selection is cached; restart after a change.
 
-The Bun helper has explicit `proxy` values: `phone` means HTTP
-`http://127.0.0.1:18889`, `direct` means `proxy:false`. **It does not support a
-`warp` route**, and relay HTTPS_PROXY does not change these helper choices.
-Do not label DeepSeek as WARP-routed simply because the Go relay env uses WARP.
-`socks5h` asks curl to resolve names through SOCKS; do not use that scheme for
-the phone's HTTP CONNECT listener.
+The native sidecar inherits the relay service environment, including
+`HTTPS_PROXY`/`NO_PROXY`; Bun's `fetch` honors them. To route free traffic
+through the phone, set `HTTPS_PROXY=http://127.0.0.1:18889` in the relay unit
+and restart it; `NO_PROXY` must not include `opencode.ai`. There is no separate
+helper route setting, and a shell's environment does not affect the running
+service until restart. `socks5h` asks curl to resolve names through SOCKS; do
+not use that scheme for the phone's HTTP CONNECT listener.
 
 Observed caveats: WARP sometimes reported connected while HTTPS timed out;
 a successful trace did not prove inference. WARP egress was 429-limited while
@@ -414,18 +396,19 @@ change between calls even without a reset; IPv6 behavior may differ.
 identity in both places causes a collision. Friends must enroll a fresh node,
 not copy it. Morph's relay/harbor/opencode/tunnel/Worker/VPC integration is a
 separate product and is not needed here. The old farm path on port 18888 is
-also separate; it is not the helper's 18889 phone listener.
+also separate; it is not the sidecar's 18889 phone egress listener.
 
-Once phone egress is verified, change the helper override to:
+Once phone egress is verified, add a relay drop-in:
 
 ```ini
 [Service]
-Environment=DS_FLASH_ROUTES=phone,direct
-Environment=DS_FLASH_AUTO_RESET=0
+Environment=HTTPS_PROXY=http://127.0.0.1:18889
+Environment=NO_PROXY=127.0.0.1,localhost
 ```
 
-Restart only the helper. Route order is startup preference; successful failover
-can make direct preferred. It does not force all laptop traffic through cellular.
+Restart the relay. This sends the Go relay and its embedded sidecar through
+cellular; it does not force all laptop traffic through the phone. Remove the
+drop-in and restart to return to direct egress.
 
 ### Telegram is a control channel, not the data proxy
 
@@ -441,10 +424,10 @@ Use a dedicated bot/chat and restrict who can trigger the phone action. Decide
 which chat the phone watches, its exact trigger, how long the mobile connection
 is down, and how its Tailscale connection returns. Keep ordinary notifications
 separate: Wraient also has `~/.codex/telegram.env` for blocker notifications;
-that is **not** the helper's reset configuration and is not included.
+that is **not** the reset engine's configuration and is not included.
 
 Install [the bundled sender and private config template](../../contrib/telegram-ip-reset/README.md).
-The compatibility helper expects exactly:
+The shared reset engine expects exactly:
 
 - executable `~/.config/opencode/skills/telegram-ip-reset/bin/telegram-ip-reset.sh`;
 - config `~/.config/telegram-ip-reset.env`, mode 0600;
@@ -452,20 +435,22 @@ The compatibility helper expects exactly:
   `TELEGRAM_IP_RESET_TEXT` matching the phone rule.
 
 Only after the owner authorizes automatic phone resets and a manual reset has
-been verified, set `DS_FLASH_AUTO_RESET=1` in the helper override and restart it.
-All-route connection/free-limit failures can request a background reset. It is
-single-flight and persists a **30-minute minimum interval** in
-`~/.local/state/opencode-cc-ds-flash/last-reset.json`. Do not delete the timestamp
-to force extra resets. It never intentionally resets WARP/Morph services.
+been verified, install `~/.config/opencode/scripts/request-reset.mjs` and its
+Telegram sender. The sidecar invokes that engine with
+`RESET_ALLOW_AUTOMATIC=1`; the engine is single-flight and shares its lock and
+cooldown with the OpenCode plugin and the `opencode-cc` Go lane. Do not delete
+the engine's timestamp to force extra resets. It never intentionally resets
+WARP/Morph services.
 
-The helper clears inherited proxy variables before invoking the sender; Bot API
-control goes direct, while its recovery probe uses phone HTTP proxy :18889.
-Sender output is discarded. The helper independently checks HTTPS trace before
-and after; where a before-IP exists it requires a changed IP, otherwise it can
-only establish restored egress. It polls up to 48 times with 5-second gaps and
-8-second probe deadlines. A reset can interrupt every service sharing that
-phone exit. Direct requests and WARP requests are unaffected by the phone IP
-change. Never treat resets as account-quota renewal or promise they repair 429s.
+The reset engine clears inherited proxy variables before invoking the sender;
+Bot API control goes direct, while its recovery probe uses phone HTTP proxy
+:18889. Sender output is discarded. The engine independently checks HTTPS trace
+before and after; where a before-IP exists it requires a changed IP, otherwise
+it can only establish restored egress. It polls up to 48 times with 5-second
+gaps and 8-second probe deadlines. A reset can interrupt every service sharing
+that phone exit. Direct requests and WARP requests are unaffected by the phone
+IP change. Never treat resets as account-quota renewal or promise they repair
+429s.
 
 ## 8. Secure local access before connecting clients
 
@@ -489,61 +474,50 @@ copies on friends' laptops; it does not publish Wraient's running service.
 ## 9. Acceptance on the friend's actual machine
 
 Unit tests and historical evidence do not establish a new machine's eligibility.
-First run a minimal real message against the exact free model, then the full
+First run a minimal real message against an exact free model, then the full
 Claude/CPA file-tool task. No model/account substitution counts as acceptance.
-Avoid dashboard quota-bar polling. The acceptance runner reads the first saved
-upstream; its config must use HTTPS opencode.ai and the intended test credential.
+Avoid dashboard quota-bar polling.
 
 ```bash
 go build ./... && go test ./...
+go test ./internal/native/ ./internal/server/
 go build -o /tmp/opencode-cc-stage .
-"$BUN_BIN" test scripts/ds-flash-gateway/gateway.test.mjs
-python3 -m venv /tmp/cc-acceptance-venv
-/tmp/cc-acceptance-venv/bin/pip install PyYAML
-# --cpa, --stage, --claude, --config allow different install locations.
-/tmp/cc-acceptance-venv/bin/python scripts/test_ds_flash_chain.py --credential saved --out /tmp/ds-proof.jsonl
-/tmp/cc-acceptance-venv/bin/python scripts/test_ds_flash_chain.py --fault-seconds 8 --out /tmp/ds-proof.jsonl
-/tmp/cc-acceptance-venv/bin/python scripts/test_ds_flash_chain.py --fault-seconds 195 --out /tmp/ds-proof.jsonl
-# Optional, only if the official CLI owns a valid active OAuth connection:
-/tmp/cc-acceptance-venv/bin/python scripts/test_ds_flash_chain.py --credential active --out /tmp/ds-proof.jsonl
 ```
 
-The runner restricts the registered tool catalog to Read/Write, uses an absolute
-proof path to avoid ambiguous tool instructions, and captures bounded verbose
-transcripts. It isolates CPA/config/Claude HOME, reserves 18789/18319/18794, enables
-staging request logs, grants only Read/Write for a generated proof file, verifies
-its contents plus successful Read/Write tool results, removes the proof before
-each phase, and cleans up its own children. The sustained test keeps the same
-CPA process for the post-recovery task. Faults are injected **before** the helper,
-so injected 429s do not trigger phone resets. Real helper failure could still
-trigger resets if enabled: keep auto-reset off during acceptance unless already
-authorized. It uses installed CPA and gateway; it does not build/install them.
-It uses the running relay's process environment when available, otherwise the
-caller's environment; pass DB overrides explicitly when using active credentials
-without a running service. The default saved config is `~/data/config.json`.
-Inspect test JSONL privately before sharing; transcripts may contain paths or
-other local details even though the configured static key is redacted.
+Deploy with section 10, then:
 
-Also test a normal live CPA invocation after staging, with your own credentials,
-then check relay/helper logs for real success and tool execution. Health alone
-is not acceptance. Keep any monitoring hourly to conserve usage; this repo
-installs no infinite watcher or free-allowance probes.
+```bash
+curl --noproxy '*' -fsS http://127.0.0.1:8787/api/health
+# Anthropic wire, free model, non-streaming. Use the client key from the panel.
+curl --noproxy '*' -sS http://127.0.0.1:8787/v1/messages \
+  -H "content-type: application/json" \
+  -H "x-api-key: $OPENCODE_CC_CLIENT_KEY" \
+  -d '{"model":"deepseek-v4.1-flash-free","max_tokens":64,
+       "messages":[{"role":"user","content":"Reply with the single word: ok"}]}'
+```
+
+Then run a real Claude Code task that must Read a file, Write a proof file and
+run one shell command; check the relay log for resolved tool calls and the
+file's contents. Health alone is not acceptance.
+
+The shape gate means a 200 on the minimal message does not prove the full tool
+surface: the tool task is the real acceptance. If the minimal message passes but
+the tool task returns `FreeUsageLimitError`, check that the sidecar sent the full
+13-tool list (`tools_unavailable_pruned` must not appear) and the exact headers
+before blaming quota.
+
+Keep any monitoring hourly to conserve usage; this repo installs no infinite
+watcher or free-allowance probes.
 
 ## 10. Updates, staging, rollback and recovery
 
-Never start a second relay on production :8787. Build/test first, check listeners,
-then stage on :18789 with a fresh private data directory and relevant saved
-upstream settings. Use the acceptance runner instead of manually copying secrets
-into shell commands. Don't reuse :18787 (Morph) or :18790 (production helper).
+Never start a second relay on production :8787. Build/test first, check
+listeners, then stage on :18789 with a fresh private data directory and relevant
+saved upstream settings. Don't reuse :18787 (Morph). The retired :18790 helper
+must not listen.
 
-Before changing a live helper, install a separate release and stage it on a free
-loopback port, e.g. 18791, using `DS_FLASH_PORT=18791`, `DS_FLASH_ROUTES=direct`,
-`DS_FLASH_AUTO_RESET=0`, and an isolated `STATE_DIRECTORY`. Pass
-`--gateway http://127.0.0.1:18791` to acceptance. Check that port first. Test the
-exact new runtime/prelude; don't infer it from an old production gateway's pass.
-
-Back up current binary, helper symlink target, private config and units locally
-with restricted permissions. After staging passes:
+Back up the current binary and private config/units with restricted permissions.
+After staging passes:
 
 ```bash
 systemctl --user stop opencode-cc
@@ -555,18 +529,18 @@ curl --noproxy '*' -fsS http://127.0.0.1:8787/api/health
 
 Atomic replacement is mandatory: Morph also executes that same binary on the
 reference machine; overwriting its running inode fails with `Text file busy`.
-Do not stop Morph. Select new helper releases with a temporary symlink + atomic
-rename and restart only the helper. Smoke a real live `/v1/messages` request and
-CPA file-tool task after deployment. Stop only your staging PID and remove its
-private temp data. Do not use broad process-name kills that can match production.
+Do not stop Morph. The Bun sidecar is embedded and restarts with the relay; there
+is no separate helper release to stage.
 
-To disable helper routing remove only the relay's `ds-flash.conf`, reload systemd
-and restart relay, then stop/disable the helper. This returns to Go transport;
-it does not guarantee the exact free model remains compatible. To roll back
-fully atomically restore the previous relay binary and helper release/config.
-Disable only this optional WARP consumer with `warp-cli disconnect`; stop only
-the isolated phone-egress unit to remove that proxy. Keep ordinary Tailscale
-and other services intact.
+To disable the native free lane, remove Bun from the discovery paths (or point
+`OPENCODE_CC_BUN` at a missing path) and restart the relay; free models then use
+the translated paid transport, which the free tier may reject. This does not
+guarantee the exact free model remains compatible.
+
+To roll back, atomically restore the previous relay binary and config. Disable
+only this optional WARP consumer with `warp-cli disconnect`; stop only the
+isolated phone-egress unit to remove that proxy. Keep ordinary Tailscale and
+other services intact.
 
 Recovery backups need source + patch bundle + pinned versions/download checksums,
 service units, private config and encrypted irreplaceable credentials/state.
@@ -577,25 +551,25 @@ identities, databases, caches or machine-specific binary backups.
 
 | Symptom | Check / meaning |
 |---|---|
-| Connection refused | Exact listener, unit status, port conflict, helper drop-in URL |
-| Helper healthy, inference fails | Health proves listener only; test real exact-model request |
+| Connection refused | Exact listener, unit status, port conflict |
+| Health 200, inference fails | Health proves listener only; test a real exact-model request |
 | 401 / expired OAuth | Correct credential identity; official CLI refresh; don't copy legacy tokens |
 | 403 FreeTierError | Client/model eligibility; key health alone is insufficient |
-| 429 FreeUsageLimitError | Could be eligibility/network/account constraints; not proof of zero account allowance |
+| 429 on a tool task | Usually the shape gate, not quota: verify the exact system prompt, all 13 tools, `User-Agent: opencode/latest/2.2.7/cli`, `X-Opencode-Client: cli`; `x-oc-reset: shape` confirms |
+| 429 with `x-oc-reset: failed` | Reset failed or the header budget expired; the lane cycles keys/resets | Wait or cancel |
 | Immediate repeated CPA cooldown | Correct patched CPA + hold enabled for this group; never clear all providers' cooldowns |
-| 429 after ~3 minutes | The opted-in hold exhausted; report genuine upstream failure |
 | WARP connected, HTTPS timeout | Proxied trace, tunnel logs and connectivity; no claim of healthy inference |
 | Phone proxy responds but Internet fails | Verify HTTPS through :18889, phone data, tailnet/exit permissions |
 | Telegram sends but no reset | Exact authorized sender/chat/text, phone automation and OS permissions |
 | HTTP 200 then truncated stream | Read stream to completion; explicit error envelope is a failed generation |
 | Wrong upstream despite env edit | Enabled saved upstream pool takes precedence |
 | Missing UI | Build Vite and copy web/dist to internal/assets/dist **before** go build |
-| Tool/context failures | Real Claude tool task, model launch context, prelude/runtime version; not just curl |
+| Tool name mismatch (`shell` vs `Bash`) | Non-streaming mapping or the sidecar's declared-name resolution; check `tools_resolved`/`tool_call_unresolved` |
 
-Use `journalctl --user -u opencode-cc -u opencode-cc-ds-flash --since '10 min ago'`
-locally; sanitize before sharing. Diagnostic probes under `scripts/probe_zen_*`
-are historical opt-in investigations with local path assumptions. Some replay
-private fixtures, consume model allowance or require the legacy auth file;
-read their `--help` and source first. They are not the installation procedure.
-Never feed the whole historical investigation into configuration as if every
-old hypothesis were current: the deployed summary supersedes older failures.
+Use `journalctl --user -u opencode-cc --since '10 min ago'` locally; sanitize
+before sharing. Diagnostic probes under `scripts/probe_zen_*` are historical
+opt-in investigations with local path assumptions. Some replay private fixtures,
+consume model allowance or require the legacy auth file; read their `--help` and
+source first. They are not the installation procedure. Never feed the whole
+historical investigation into configuration as if every old hypothesis were
+current: the deployed summary supersedes older failures.

@@ -63,14 +63,17 @@ sharing the good lane.
   failures: rotating every key of the same account would hit the same wall and
   hide the real error.
 - **Quota failover:** a `429` marks the key *limited* for 60 seconds (never
-  dead) and retries with the next key. This is the last resort, used only after
-  the free-tier sidecar has already attempted its egress reset for that
-  request. Free-lane retries carry `x-bridge-no-reset: 1`, so rotating through
-  the pool does not cycle the phone's radio once per key.
-- **Bounded:** failover skips every key already dead or limited, so a request
-  makes at most one attempt per configured key and always returns the real
-  upstream error. A limited key becomes usable again automatically when its
-  60-second window passes.
+  dead) and retries with the next key. On the free lane the cycle is
+  indefinite: every key gets its own egress-reset attempt, then the pool is
+  walked again in cyclic order (`key1 → key2 → … → key5 → key1`) with
+  exponential backoff (5 s → 30 s). Free-lane retries no longer send
+  `x-bridge-no-reset`; that header only belonged to the old bounded ladder.
+- **Bounded:** a single pass skips every key already dead or limited, so one
+  pass makes at most one attempt per configured key. The free lane repeats
+  passes until the request succeeds, its context is cancelled, or a generous
+  40-attempt safety ceiling is reached; that ceiling keeps a permanently
+  limited IP from pinning an in-flight slot forever. The last real upstream
+  error is returned unchanged.
 - **Free models:** the Go layer passes the selected key to the Bun free-tier
   sidecar on the authenticated loopback leg and scopes selection to the Zen
   base, so a key belonging to another upstream can never be sent to Zen.

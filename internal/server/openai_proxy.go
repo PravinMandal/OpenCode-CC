@@ -315,6 +315,9 @@ func (s *Server) relayOpenAIJSON(
 			http.StatusBadGateway, msg, reqBody, time.Since(start))
 		return
 	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		raw = filterUndeclaredOpenAIToolsRaw(raw, reqBody)
+	}
 
 	copyOpenAIHeaders(w.Header(), resp.Header, false)
 	status := resp.StatusCode

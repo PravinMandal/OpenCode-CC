@@ -142,15 +142,13 @@ Zen also gates the free lane on the tool set. Measured on 2026-11-02:
 The sidecar therefore:
 
 1. replaces the client's tool list with the captured canonical tools;
-2. removes every canonical tool the client cannot run at all — not just a
-   trailing suffix, because a dead tool in the middle stays callable while a
-   note claims it is unavailable (today: Code Mode's `execute` for T3's
-   Claude Code lane, which declares no execution tool) — and logs
-   `tools_unavailable_pruned`; the captured prompt still describes the pruned
-   tools, so a system note right after it says they are unavailable. Without
-   this, the model calls `execute`, the Go layer has no declared target, and
-   the turn ends with a dropped-call notice. The remaining canonical tools
-   keep the free-tier gate's accepted shape;
+2. **always sends the full captured 13-tool list**, even when the client
+   cannot run a tool (today: Code Mode's `execute` for T3's Claude Code lane,
+   which declares no execution tool). Pruning even one entry was measured to
+   break the shape fingerprint: the request still returned
+   `FreeUsageLimitError` while quota was available. A system note right after
+   the captured prompt names the tools the client cannot run, and the Go layer
+   turns a dead call into a tool error instead of dropping the turn;
 3. suppresses client-only tools and logs `tools_suppressed` once per distinct
    tool-name set;
 4. keeps the client's tools executable by translating the canonical call back
@@ -163,10 +161,9 @@ The sidecar therefore:
 `BRIDGE_CLIENT_TOOL_EXTRAS=1` appends client tools for deliberate experiments,
 but that shape is known to be rejected by the free tier and is not the default.
 
-`BRIDGE_KEEP_DEAD_TOOLS=1` disables the dead-tool prune and sends the full
-captured list; the system note still names the tools the client cannot run, so
-the model is told not to call them. Use it only if the free-tier shape gate
-starts rejecting the shorter canonical list.
+`BRIDGE_KEEP_DEAD_TOOLS=0` is a debugging escape hatch that restores the old
+pruned shape. Do not set it in production: the free-tier gate fingerprints the
+complete stock tool set, and the pruned shape produced fake quota 429s.
 
 The captured system prompt embeds the capture date, so the sidecar substitutes
 today's date at request time; otherwise an identity captured yesterday would be
@@ -243,34 +240,52 @@ All knobs are optional environment variables read by the sidecar:
 
 A non-quota 429 is returned to the caller as-is. A free-tier
 `FreeUsageLimitError` is ambiguous: it can reflect quota state, account/session
-affinity, or a request rejected by the free-tier gate. The sidecar walks the
-bounded recovery ladder described above (up to two pool ids → one reset → one
-fresh id), joins a reset already in flight or waits out a foreign lock. The
-bridge does not claim that every successful IP change guarantees quota; the
-provider does not publish enough detail to distinguish these causes from the
-error body alone. A 429 is surfaced when recovery is unsuccessful or the
-current account/egress/request combination is still rejected.
+affinity, or a request rejected by the free-tier gate. The sidecar joins a
+reset already in flight or waits out a foreign lock. The bridge does not claim
+that every successful IP change guarantees quota; the provider does not publish
+enough detail to distinguish these causes from the error body alone.
+
+The Go free lane treats a 429 as **limited, never dead**, and cycles the
+configured keys indefinitely:
+
+1. the request starts on the current key; the sidecar attempts its own
+   recovery (lease fallbacks and one egress reset) for that key;
+2. if the attempt still returns 429, the Go layer marks that key limited for
+   60 seconds and retries with the next key in cyclic order
+   (`key1 → key2 → … → key5 → key1`);
+3. every key gets its own reset attempt. The Go layer no longer sends
+   `x-bridge-no-reset`; that header existed only to stop the old bounded
+   ladder from cycling the radio five times for one request;
+4. after a full pass over the pool, the lane waits with exponential backoff
+   (5 s, then +5 s per pass, capped at 30 s) and starts the next pass. The
+   cycle repeats until the request succeeds, its context is cancelled, or a
+   generous 40-attempt safety ceiling is reached. The ceiling exists so a
+   permanently limited IP returns the real upstream error instead of pinning
+   an in-flight slot forever; with five keys it is several minutes, well past
+   the reset engine's cooldown.
+
+Keys from different accounts do not inherit the captured account's
+`x-opencode-org-id` / `x-opencode-workspace-id`: a `403 Workspace access
+denied` drops those headers for that credential and moves it to a key-scoped
+lease lane. Leases are key-scoped, so one account's session id is never replayed
+with another account's key.
 
 The sidecar adds diagnostic headers to a 429:
 
 - `x-oc-native: 1`
-- `x-oc-reset: manual` (non-quota 429), `failed` (reset failed/backoff/disabled),
-  `retried` (reset succeeded but the retry is still limited), `shape`
-  (reset + fresh-id retry still limited; resets are skipped for this shape),
-  or `skipped` (the Go layer set `x-bridge-no-reset: 1` while rotating keys,
-  so the already-attempted egress reset must not be repeated)
-
-When Go rotates API keys after a `failed`/`shape`/`skipped` 429, it sends the
-next attempt with `x-bridge-no-reset: 1`. The sidecar still tries its bounded
-lease fallbacks, but skips the reset ladder and surfaces the 429 immediately;
-otherwise five configured keys would cycle the phone's radio five times for a
-single request. The shape-failure cache is scoped by credential as well as
-account, so a rotated key makes a real attempt instead of inheriting the
-previous key's cached 429.
+- `x-oc-reset: manual` (non-quota 429), `failed` (reset failed, budget
+  expired, or disabled), `shape` (reset + fresh-id retry still limited; resets
+  are skipped for this shape), or `skipped` (legacy: the caller sent
+  `x-bridge-no-reset`; the current Go lane never does)
 - `x-oc-reset-source: opencode-cc`
 - `retry-after` is deliberately **not** forwarded: the upstream value can be
   hours long and would lock local clients out. `x-oc-reset` describes the local
   recovery state instead.
+
+The shape-failure cache is scoped by credential as well as account, so a
+rotated key makes a real attempt instead of inheriting the previous key's
+cached 429. If every key reports `shape`, the request itself is unpassable and
+no amount of radio cycling will help; the real 429 is surfaced.
 
 `/health` reports `quota.automaticRecovery: true`, the reset source, cooldown,
 and `lease.pool`, `lease.lastGoodAgeMs`, `lease.fallbackAttempts` for diagnosis.
