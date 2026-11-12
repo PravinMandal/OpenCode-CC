@@ -78,9 +78,13 @@ func newNativeTransport(base http.RoundTripper, mgr nativeEndpoint, pool *creden
 			DialContext:         (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
 			MaxIdleConnsPerHost: 32,
 			// The sidecar may wait minutes for upstream headers and can spend
-			// ~150s rotating an exhausted egress prefix, so this leg must not
-			// impose a shorter deadline than the sidecar itself.
-			ResponseHeaderTimeout: 0,
+			// ~150s rotating an exhausted egress prefix. This leg must not
+			// impose a shorter deadline than the sidecar's own total budget
+			// (HEADER_TIMEOUT + TRANSPORT_RETRY_BUDGET_MS = 270s), but it must
+			// impose one: with no deadline a hung Bun process pins the request
+			// (and the client) forever. Five minutes is a backstop above the
+			// sidecar's budget, not the primary bound.
+			ResponseHeaderTimeout: 5 * time.Minute,
 			IdleConnTimeout:       90 * time.Second,
 		},
 	}

@@ -68,22 +68,31 @@ func credentialID(key string) string {
 // snapshot returns the resolved pool, refreshing it at most every
 // credentialPoolTTL. force is used after an auth failure, when the caller wants
 // to see a credential that was just rotated in or out of the config.
+//
+// ResolvedUpstreams can open the OpenCode SQLite database. Resolve outside the
+// mutex: holding it across that read serialized every failover and every
+// concurrent request behind disk I/O.
 func (p *credentialPool) snapshot(force bool) []cfgpkg.ResolvedUpstream {
 	if p == nil || p.cfg == nil {
 		return nil
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if !force && len(p.resolved) > 0 && p.now().Sub(p.loadedAt) < credentialPoolTTL {
 		out := make([]cfgpkg.ResolvedUpstream, len(p.resolved))
 		copy(out, p.resolved)
+		p.mu.Unlock()
 		return out
 	}
+	p.mu.Unlock()
+
 	out := p.cfg.ResolvedUpstreams()
-	p.resolved = out
-	p.loadedAt = p.now()
 	cp := make([]cfgpkg.ResolvedUpstream, len(out))
 	copy(cp, out)
+
+	p.mu.Lock()
+	p.resolved = out
+	p.loadedAt = p.now()
+	p.mu.Unlock()
 	return cp
 }
 
@@ -208,8 +217,13 @@ func (p *credentialPool) nextAfter(current, base string) (string, bool) {
 // key is retried. Dead keys are still skipped, and reaching the current key
 // again returns it so a single-key deployment keeps retrying instead of
 // stopping after one pass. The caller bounds the cycle by request context.
+//
+// The pool is not force-refreshed: a quota 429 says nothing about the
+// configuration, and forcing a SQLite resolve on every rotation turned a
+// 40-attempt cycle into 40 database reads. nextAfter keeps the forced refresh
+// for auth failures, where the configured key may have just been rotated.
 func (p *credentialPool) nextCyclic(current, base string) (string, bool) {
-	pool := p.snapshot(true)
+	pool := p.snapshot(false)
 	start := -1
 	for i, u := range pool {
 		if u.APIKey == current {

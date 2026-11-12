@@ -1526,7 +1526,18 @@ function resetResult(code, output, started) {
 
 async function spawnReset(meta) {
   const started = Date.now();
-  log({ event: "quota_reset_start", ...meta, source: RESET_SOURCE });
+  // A reset is only useful while the request that triggered it can still
+  // receive the retry. RESET_TIMEOUT_MS is a standalone safety cap; clamp it
+  // to the request's own header budget so a 10-minute radio cycle cannot
+  // outlive the Go free lane's 3-minute wall clock (and return a 502 after the
+  // caller already gave up).
+  const requestDeadline = Number(meta?.started || started) + HEADER_TIMEOUT + TRANSPORT_RETRY_BUDGET_MS;
+  const resetBudget = Math.max(0, Math.min(RESET_TIMEOUT_MS, requestDeadline - started));
+  if (resetBudget <= 0) {
+    log({ event: "quota_reset_skipped_deadline", ...meta, budgetMs: 0 });
+    return { ok: false, how: "deadline", ms: 0 };
+  }
+  log({ event: "quota_reset_start", ...meta, source: RESET_SOURCE, budgetMs: resetBudget });
   let proc;
   try {
     proc = Bun.spawn([RESET_NODE, RESET_SCRIPT, `--source=${RESET_SOURCE}`], {
@@ -1551,7 +1562,7 @@ async function spawnReset(meta) {
     try { process.kill(-proc.pid, signal); }
     catch { try { proc.kill(signal); } catch {} }
   };
-  const timer = setTimeout(() => killReset("SIGKILL"), RESET_TIMEOUT_MS);
+  const timer = setTimeout(() => killReset("SIGKILL"), resetBudget);
   try {
     const [out, err, code] = await Promise.all([
       new Response(proc.stdout).text(),
