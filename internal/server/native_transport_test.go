@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeNativeEndpoint struct {
@@ -207,6 +208,83 @@ func TestNativeFreeLaneCycleIsBounded(t *testing.T) {
 		if want := keys[i%len(keys)]; got != want {
 			t.Fatalf("attempt %d credential = %q, want %q", i, got, want)
 		}
+	}
+}
+
+// TestNativeFreeLaneStopsAfterShapePass proves a request shape that is
+// unpassable on every key is surfaced after one real attempt per key instead
+// of cycling the pool (and the radio) for the full attempt ceiling.
+func TestNativeFreeLaneStopsAfterShapePass(t *testing.T) {
+	zeroFreeLaneCycleDelays(t)
+	var mu sync.Mutex
+	var creds []string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		creds = append(creds, r.Header.Get("x-bridge-credential"))
+		mu.Unlock()
+		w.Header().Set("x-oc-reset", "shape")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+	}))
+	defer sidecar.Close()
+
+	pool := newCredentialPool(failoverConfig("key-one", "key-two", "key-three"))
+	tr := newNativeTransport(&scriptedRoundTripper{}, fakeNativeEndpoint{
+		url: sidecar.URL + "/v1/chat/completions", token: "tok", enable: true,
+	}, pool)
+	req := nativeTestRequest(t)
+	req.Header.Set("Authorization", "Bearer key-one")
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+	if len(creds) != 3 {
+		t.Fatalf("credentials = %v, want one attempt per key (3), not a full cycle", creds)
+	}
+}
+
+// TestNativeFreeLaneRespectsElapsedBudget proves the wall-clock budget stops a
+// permanently limited upstream even before the attempt ceiling.
+func TestNativeFreeLaneRespectsElapsedBudget(t *testing.T) {
+	zeroFreeLaneCycleDelays(t)
+	oldElapsed := freeLaneMaxElapsed
+	freeLaneMaxElapsed = time.Nanosecond
+	t.Cleanup(func() { freeLaneMaxElapsed = oldElapsed })
+
+	var mu sync.Mutex
+	var creds []string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		creds = append(creds, r.Header.Get("x-bridge-credential"))
+		mu.Unlock()
+		w.Header().Set("x-oc-reset", "failed")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+	}))
+	defer sidecar.Close()
+
+	pool := newCredentialPool(failoverConfig("key-one", "key-two", "key-three"))
+	tr := newNativeTransport(&scriptedRoundTripper{}, fakeNativeEndpoint{
+		url: sidecar.URL + "/v1/chat/completions", token: "tok", enable: true,
+	}, pool)
+	req := nativeTestRequest(t)
+	req.Header.Set("Authorization", "Bearer key-one")
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+	if len(creds) > 2 {
+		t.Fatalf("credentials = %v, want the elapsed budget to stop after the first retry", creds)
 	}
 }
 

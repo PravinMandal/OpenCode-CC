@@ -185,6 +185,63 @@ func TestOpenAIChatCompletionsNonStreamResolvesCanonicalToolName(t *testing.T) {
 	}
 }
 
+// A client that declared no tools must not receive a phantom canonical call:
+// the sidecar always offers the 13 tools, so the response needs the same
+// filtering the streaming lane applies.
+func TestOpenAIChatCompletionsNonStreamDropsUndeclaredToolCall(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-test",
+			"object":"chat.completion",
+			"model":"glm-5.1",
+			"choices":[{"index":0,"message":{"role":"assistant","content":null,
+				"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"echo hi\"}"}}]},
+				"finish_reason":"tool_calls"}]
+		}`)
+	})
+	_, _, httpSrv := newOpenAITestServer(t, upstream)
+
+	requestBody := `{
+		"model":"client-model",
+		"stream":false,
+		"messages":[{"role":"user","content":"run echo hi"}]
+	}`
+	req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/chat/completions", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	var out struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode response: %v (%s)", err, raw)
+	}
+	if len(out.Choices) != 1 {
+		t.Fatalf("missing choice: %s", raw)
+	}
+	if len(out.Choices[0].Message.ToolCalls) != 0 {
+		t.Errorf("undeclared tool calls survived: %s", raw)
+	}
+	if out.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want stop (raw: %s)", out.Choices[0].FinishReason, raw)
+	}
+}
+
 func TestPrepareOpenAIRequestSortsTools(t *testing.T) {
 	srv, _, _ := newOpenAITestServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	upBody, incoming, target, stream, err := srv.prepareOpenAIRequest([]byte(`{

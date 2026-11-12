@@ -33,11 +33,12 @@ type nativeEndpoint interface {
 // Free-lane quota cycling. A free-limit 429 is an IP-wide condition, so the
 // lane resets the egress through the sidecar and then moves through every key
 // in the pool, wrapping back to the first and repeating. These are variables
-// so tests can shrink the delays; the attempt ceiling is a safety valve for a
-// pathological upstream (a client that disconnects cancels the request
-// immediately and ends the loop).
+// so tests can shrink the delays; the elapsed budget and attempt ceiling are
+// safety valves for a pathological upstream (a client that disconnects cancels
+// the request immediately and ends the loop).
 var (
 	freeLaneMaxAttempts = 40
+	freeLaneMaxElapsed  = 3 * time.Minute
 	freeLaneCycleDelay  = 5 * time.Second
 	freeLaneMaxDelay    = 30 * time.Second
 )
@@ -195,16 +196,20 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// attempt once the reset engine's cooldown expires. Rotation therefore
 	// cycles key 1..N indefinitely rather than stopping after one pass; the
 	// sidecar's reset engine collapses attempts inside its cooldown into one
-	// radio cycle. The loop is bounded by the request context and a generous
-	// attempt ceiling so a pathological upstream cannot pin the connection
-	// forever. Auth failures keep the stricter nextAfter path: a dead key is
-	// not revived by a reset.
+	// radio cycle. The loop is bounded by the request context, a wall-clock
+	// budget and a generous attempt ceiling so a pathological upstream cannot
+	// pin the connection forever. Auth failures keep the stricter nextAfter
+	// path: a dead key is not revived by a reset.
+	started := time.Now()
 	startCredential := credential
+	passSeen := map[string]bool{startCredential: true}
+	shapeThisPass := make(map[string]bool, 8)
 	cycles := 0
 	attempts := 0
 	for resp != nil && t.pool != nil && credential != "" {
 		quota := false
 		rotatable := false
+		shape := false
 		switch resp.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
 			prefix, _ := peekReplayBody(resp, credentialErrorPeek)
@@ -216,17 +221,21 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			// The sidecar sets x-oc-reset when it handled a free-limit 429.
 			// "manual" means it is not a quota response at all; rotating keys
 			// would only hide the real error. "shape" means a reset completed
-			// but a fresh egress still returned the limit: the shape cache is
-			// key-scoped and expires, so keep it in the quota cycle for a
-			// later reset attempt instead of treating it as terminal.
+			// but a fresh egress still returned the limit: each key gets one
+			// real attempt, but if every key reports shape the request itself
+			// is unpassable and another pass cannot help.
 			switch resp.Header.Get("x-oc-reset") {
 			case "failed", "shape", "skipped":
 				t.pool.markLimited(credential)
 				rotatable, quota = true, true
+				shape = resp.Header.Get("x-oc-reset") == "shape"
 			}
 		}
 		if !rotatable {
 			break
+		}
+		if shape {
+			shapeThisPass[credential] = true
 		}
 		var next string
 		var ok bool
@@ -241,32 +250,50 @@ func (t *nativeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if !ok {
 			break
 		}
-		drainAndClose(resp.Body)
 		if quota {
-			attempts++
-			if next == startCredential {
-				// A full pass over the pool produced no success. Back off so
-				// the next pass starts after the reset cooldown and can
-				// actually rotate the egress instead of replaying a cached
-				// rejection.
+			if passSeen[next] {
+				// A full pass over the pool produced no success. If every key
+				// reported a shape failure in this pass, the request itself is
+				// unpassable; surface the real 429 instead of cycling again.
+				if n := t.pool.count(cfgpkg.DefaultUpstreamBase); n > 0 && len(shapeThisPass) >= n {
+					break
+				}
 				cycles++
-				delay := freeLaneCycleDelay * time.Duration(cycles)
+				delay := freeLaneCycleDelay
+				for i := 1; i < cycles && delay < freeLaneMaxDelay; i++ {
+					delay *= 2
+				}
 				if delay > freeLaneMaxDelay {
 					delay = freeLaneMaxDelay
+				}
+				if time.Since(started)+delay > freeLaneMaxElapsed {
+					break
 				}
 				if !sleepContext(r.Context(), delay) {
 					return nil, r.Context().Err()
 				}
+				passSeen = map[string]bool{next: true}
+				shapeThisPass = make(map[string]bool, 8)
+			} else {
+				passSeen[next] = true
+			}
+			if time.Since(started) > freeLaneMaxElapsed {
+				break
 			}
 			if err := r.Context().Err(); err != nil {
 				return nil, err
 			}
+			attempts++
 		}
+		// Take the replay body before closing the current response: if it
+		// fails, the caller still receives the intact upstream response.
 		body, bodyErr := r.GetBody()
 		if bodyErr != nil {
 			break
 		}
+		drainAndClose(resp.Body)
 		local.Body = body
+		local.Header.Del("x-bridge-credential")
 		local.Header.Set("x-bridge-credential", next)
 		// Every attempt (including a rotated key) may reset the egress: the
 		// previous attempt's reset either failed or was too recent, and the

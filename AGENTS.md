@@ -113,10 +113,11 @@
   credential-related, including a workspace denial, marks that key dead for
   five minutes and replays the request with the next key; a quota/billing 403
   is surfaced instead. A `429` marks the key *limited* for 60 seconds and
-  rotates to the next key. On the free lane every key gets its own egress-reset
-  attempt and the pool is cycled indefinitely (`key1 → … → key5 → key1`) with
-  5–30 s backoff, bounded by the request context and a 40-attempt safety
-  ceiling. The old `x-bridge-no-reset` header is no longer sent.
+  rotates to the next key. On the free lane every key is tried with a reset
+  request (the shared engine collapses recent requests into one radio cycle)
+  and the pool is cycled (`key1 → … → key5 → key1`) with exponential 5–30 s
+  backoff, bounded by the request context, a 3-minute wall-clock budget and a
+  40-attempt ceiling. The old `x-bridge-no-reset` header is no longer sent.
 - A key from a different account must not inherit the captured account's
   workspace header or session lease. The sidecar learns the mismatch from the
   first `403 Workspace access denied`, drops `x-opencode-org-id` /

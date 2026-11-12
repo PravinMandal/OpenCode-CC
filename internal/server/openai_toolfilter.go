@@ -702,13 +702,13 @@ func setToolCallName(call map[string]json.RawMessage, name string) bool {
 // (non-streaming) Chat Completions response to the names the client declared.
 // The streaming lane resolves every delta; without this a free-lane response
 // carries "shell" while a client that declared "Bash" dispatches only its own
-// names and silently never runs the call. Only the affected fields are
-// re-encoded, so provider-specific response fields survive untouched.
+// names and silently never runs the call. Only the affected values are
+// rewritten; the rest of the envelope is carried through as raw JSON.
 func filterUndeclaredOpenAIToolsRaw(raw, reqBody []byte) []byte {
+	// An empty declared list is meaningful: the sidecar always sends the
+	// canonical tools, so a client that declared none must not receive a
+	// phantom tool call it cannot dispatch.
 	declared := declaredOpenAIToolNames(reqBody)
-	if len(declared) == 0 {
-		return raw
-	}
 	schemas := declaredOpenAIToolSchemas(reqBody)
 
 	var top map[string]json.RawMessage

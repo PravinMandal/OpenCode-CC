@@ -844,10 +844,10 @@ function sessionFor(scope) {
 // markGoodSession records that the upstream accepted this id. The mapping for
 // the scope is rewritten too: a fallback request must not keep generating a
 // fresh, unleased id on every turn.
-function markGoodSession(scope, id) {
+function markGoodSession(scope, id, credentialOverride = "") {
   if (!validSessionId(id)) return;
   const now = Date.now();
-  const cred = leaseAccount();
+  const cred = leaseAccount(credentialOverride);
   lastGoodSession = id;
   lastGoodAt = now;
   lastGoodCred = cred;
@@ -890,7 +890,10 @@ function baseHeaders(modelHeaders) {
   return {
     accept: "*/*",
     "content-type": "application/json",
-    "user-agent": ident["user-agent"] || "opencode/latest/cli",
+    // The free-tier gate fingerprints this exact versioned UA. The captured
+    // identity normally supplies it; the fallback must not silently downgrade
+    // to the unversioned form.
+    "user-agent": ident["user-agent"] || "opencode/latest/2.2.7/cli",
     "x-opencode-client": ident["x-opencode-client"] || "cli",
     "x-opencode-project": ident["x-opencode-project"] || "global",
     ...(ident["x-opencode-org-id"] ? { "x-opencode-org-id": ident["x-opencode-org-id"] } : {}),
@@ -1778,7 +1781,7 @@ async function upstream(body, inbound, meta, lease) {
       return relayText(text, response);
     }
     if (response.status !== 429) {
-      if (response.ok) markGoodSession(lease.scope, sessionId);
+      if (response.ok) markGoodSession(lease.scope, sessionId, credentialOverride);
       // Logged after the lease is recorded: an accepted fresh id is leased
       // from this moment on, and calling it "new" sent the last diagnosis
       // looking for a rotation that had not happened.
@@ -1883,7 +1886,10 @@ async function upstream(body, inbound, meta, lease) {
     }
 
     // 4. Same shape cannot pass; stop cycling the radio for it.
-    rememberShapeFailure(shapeKey);
+    // The failure was measured after recovery, so record it under the
+    // post-reset lease key. Recording the pre-reset key made the cache miss
+    // on the next pass and allowed a pointless reset loop for the same shape.
+    rememberShapeFailure(leaseShapeKey(meta, credentialOverride));
     log({ event: "quota_shape_failed", ...meta, attempt, shape: meta.shape });
     return passThrough429(response, text, "shape");
   }

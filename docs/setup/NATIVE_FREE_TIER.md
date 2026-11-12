@@ -51,17 +51,22 @@ request shape. Treat the exact quota scope as empirical, not a contract.
 
 The sidecar therefore:
 
-1. derives one lease scope from the **account identity** (the captured
-   workspace/org header) and client session headers, not from an individual
-   key. Rotating an expired key belonging to the same account must not discard
-   an established lease or open a new quota lane;
+1. derives the lease scope from the **account identity** (the captured
+   workspace/org header) and client session headers for same-account keys, so
+   rotating an expired key belonging to the same account does not discard an
+   established lease. A key that hits `Workspace access denied` is learned as
+   foreign and moved to its own `cred:<fingerprint>` lease lane;
 2. captures the stock OpenCode request shape once per account. Captures contain
    workspace/org headers as well as the system prompt and tools; sending a new
    account's bearer with the previous account's captured workspace produces
-   `Workspace access denied`. A key change alone does not recapture; a workspace
-   denial triggers one recapture and retry, and the bridge never waits on a
-   per-request credential poll. A capture that lands while the account changes
-   is only adopted if the file it wrote is newer than the capture started;
+   `Workspace access denied`. A key change alone does not recapture. On a
+   workspace denial the sidecar drops the captured org/workspace headers for
+   that key, takes a key-scoped lease, and retries once; it does not recapture
+   the stock shape for a key from another account. The first attempt for a
+   newly configured foreign key still carries the captured headers, so the
+   denial is the discovery step. The bridge never waits on a per-request
+   credential poll. A capture that lands while the account changes is only
+   adopted if the file it wrote is newer than the capture started;
 3. accepts the key selected by the Go credential pool on the authenticated
    loopback leg (`x-bridge-credential`). With no header it falls back to the
    active OpenCode database credential for standalone use. The inbound public
@@ -147,8 +152,10 @@ The sidecar therefore:
    which declares no execution tool). Pruning even one entry was measured to
    break the shape fingerprint: the request still returned
    `FreeUsageLimitError` while quota was available. A system note right after
-   the captured prompt names the tools the client cannot run, and the Go layer
-   turns a dead call into a tool error instead of dropping the turn;
+   the captured prompt names the tools the client cannot run. If the model
+   still calls one, the Go layer drops the call rather than sending an
+   undeclared tool name to the client; the streaming Anthropic lane also emits
+   a visible notice so the turn does not end silently;
 3. suppresses client-only tools and logs `tools_suppressed` once per distinct
    tool-name set;
 4. keeps the client's tools executable by translating the canonical call back
@@ -169,9 +176,10 @@ cannot run a tool, but the tool is still sent); `tools_unavailable_pruned`
 appears only when the kill switch actually removed one and should never be seen
 in production.
 
-The captured system prompt embeds the capture date, so the sidecar substitutes
-today's date at request time; otherwise an identity captured yesterday would be
-rejected.
+The sidecar prepends the captured stock system prompt and substitutes today's
+date at request time (the capture embeds its own date, so an identity captured
+yesterday would otherwise be rejected). Non-canonical client system messages
+are kept after the captured prompt; the stock block stays first.
 
 ## GLM compatibility
 
@@ -202,9 +210,11 @@ curl --noproxy '*' -sS http://127.0.0.1:8787/api/health
 journalctl --user -u opencode-cc --since '5 min ago' | grep native
 ```
 
-A free request must not use the inbound client key upstream. The sidecar
-resolves the live OpenCode credential itself and clears the inbound
-`Authorization` header.
+The inbound public client key never reaches the sidecar. The Go layer
+authenticates the client at the public listener, then sets
+`x-bridge-credential` to the selected pool key on the loopback leg. In
+standalone mode with no header, the sidecar resolves the live OpenCode
+credential itself. The public `Authorization` is not forwarded.
 
 ## Configuration
 
@@ -249,30 +259,34 @@ reset already in flight or waits out a foreign lock. The bridge does not claim
 that every successful IP change guarantees quota; the provider does not publish
 enough detail to distinguish these causes from the error body alone.
 
-The Go free lane treats a 429 as **limited, never dead**, and cycles the
-configured keys indefinitely:
+The Go free lane treats a free-limit 429 as **limited, never dead**, and cycles
+the configured keys:
 
 1. the request starts on the current key; the sidecar attempts its own
    recovery (lease fallbacks and one egress reset) for that key;
-2. if the attempt still returns 429, the Go layer marks that key limited for
-   60 seconds and retries with the next key in cyclic order
-   (`key1 → key2 → … → key5 → key1`);
-3. every key gets its own reset attempt. The Go layer no longer sends
-   `x-bridge-no-reset`; that header existed only to stop the old bounded
-   ladder from cycling the radio five times for one request;
-4. after a full pass over the pool, the lane waits with exponential backoff
-   (5 s, then +5 s per pass, capped at 30 s) and starts the next pass. The
-   cycle repeats until the request succeeds, its context is cancelled, or a
-   generous 40-attempt safety ceiling is reached. The ceiling exists so a
-   permanently limited IP returns the real upstream error instead of pinning
-   an in-flight slot forever; with five keys it is several minutes, well past
-   the reset engine's cooldown.
+2. if the attempt still returns a labeled free-limit 429, the Go layer marks
+   that key limited for 60 seconds and retries with the next key in cyclic
+   order (`key1 → key2 → … → key5 → key1`). A 429 without a free-limit label
+   (for example `x-oc-reset: manual`) is surfaced, because rotating keys would
+   only hide the real error;
+3. every key attempt asks the sidecar to recover, but the shared reset engine
+   is single-flight: requests inside its cooldown join or wait for one radio
+   cycle instead of starting another. "A reset per key" means each key is tried
+   with a reset request, not that five radios cycle for one request;
+4. after a full pass over the pool, the lane backs off exponentially (5 s,
+   10 s, 20 s, capped at 30 s) and starts the next pass. The cycle repeats
+   until the request succeeds, its context is cancelled, a 3-minute wall-clock
+   budget expires, or the 40-attempt ceiling is reached. The budget and ceiling
+   keep a permanently limited IP from pinning an in-flight slot forever; in
+   normal operation a pass is long enough to clear the reset cooldown.
 
-Keys from different accounts do not inherit the captured account's
-`x-opencode-org-id` / `x-opencode-workspace-id`: a `403 Workspace access
-denied` drops those headers for that credential and moves it to a key-scoped
-lease lane. Leases are key-scoped, so one account's session id is never replayed
-with another account's key.
+Keys from different accounts do not permanently inherit the captured
+account's `x-opencode-org-id` / `x-opencode-workspace-id`. The first attempt for
+a newly configured key still carries the captured headers (that is how the
+mismatch is discovered); a `403 Workspace access denied` then drops those
+headers for that credential and moves it to a key-scoped lease lane. Leases are
+key-scoped, so one account's session id is never replayed with another
+account's key.
 
 The sidecar adds diagnostic headers to a 429:
 
@@ -286,10 +300,12 @@ The sidecar adds diagnostic headers to a 429:
   hours long and would lock local clients out. `x-oc-reset` describes the local
   recovery state instead.
 
-The shape-failure cache is scoped by credential as well as account, so a
-rotated key makes a real attempt instead of inheriting the previous key's
-cached 429. If every key reports `shape`, the request itself is unpassable and
-no amount of radio cycling will help; the real 429 is surfaced.
+The shape-failure cache is scoped by credential, account, egress and the last
+successful reset time, so a rotated key makes a real attempt and a reset that
+actually changed the egress is retried. The failure is recorded under the
+post-recovery key, so a later pass hits the cache instead of cycling the radio
+again. If every key reports `shape` in one pass, the request itself is
+unpassable; the Go lane surfaces the real 429 immediately.
 
 `/health` reports `quota.automaticRecovery: true`, the reset source, cooldown,
 and `lease.pool`, `lease.lastGoodAgeMs`, `lease.fallbackAttempts` for diagnosis.

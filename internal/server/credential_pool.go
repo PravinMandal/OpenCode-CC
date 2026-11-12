@@ -227,6 +227,23 @@ func (p *credentialPool) nextCyclic(current, base string) (string, bool) {
 	return "", false
 }
 
+// count returns the number of configured keys for a base. The free lane uses
+// it to recognise a full pass over the pool, including keys that are currently
+// marked dead or limited.
+func (p *credentialPool) count(base string) int {
+	if p == nil {
+		return 0
+	}
+	pool := p.snapshot(false)
+	n := 0
+	for _, u := range pool {
+		if matchesBase(u.BaseURL, base) {
+			n++
+		}
+	}
+	return n
+}
+
 // matchesBase reports whether an upstream base is the destination of this
 // request. An empty base matches everything.
 func matchesBase(upstreamBase, requestBase string) bool {

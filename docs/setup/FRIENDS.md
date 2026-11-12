@@ -27,8 +27,8 @@ Telegram control: local script --> Bot API --> phone automation --> cellular res
 > Bun sidecar on an ephemeral loopback port and routes every `-free` model
 > through it. New installs do not need `opencode-cc-ds-flash.service` or the
 > `ds-flash.conf` drop-in. See
-> [Native free-tier transport](NATIVE_FREE_TIER.md). The helper instructions
-> later in this guide are retained as history for older deployments.
+> [Native free-tier transport](NATIVE_FREE_TIER.md). This guide describes the
+> current native sidecar; the old helper deployment is not supported.
 
 **Ready for a technical friend's supervised installation, not a turnkey or
 unlimited free service.** Use your own account, key, phone, tailnet and bot. A
@@ -224,9 +224,9 @@ What the sidecar does, and why it must not be "optimized":
   `x-opencode-org-id`/`x-opencode-workspace-id` when a key belongs to a
   different workspace;
 - on a 429, joins or starts one shared egress reset per attempt; the Go layer
-  then cycles keys (`key1 → … → key5 → key1`) with 5–30 s backoff until the
-  request succeeds, its context is cancelled, or a 40-attempt safety ceiling
-  is reached.
+  then cycles keys (`key1 → … → key5 → key1`) with exponential 5–30 s backoff
+  until the request succeeds, its context is cancelled, a 3-minute wall-clock
+  budget expires, or a 40-attempt safety ceiling is reached.
 
 The full contract, env table and diagnostics are in
 [`NATIVE_FREE_TIER.md`](NATIVE_FREE_TIER.md). A new install needs only Bun and
@@ -557,7 +557,7 @@ identities, databases, caches or machine-specific binary backups.
 | 401 / expired OAuth | Correct credential identity; official CLI refresh; don't copy legacy tokens |
 | 403 FreeTierError | Client/model eligibility; key health alone is insufficient |
 | 429 on a tool task | Usually the shape gate, not quota: verify the exact system prompt, all 13 tools, `User-Agent: opencode/latest/2.2.7/cli`, `X-Opencode-Client: cli`; `x-oc-reset: shape` confirms |
-| 429 with `x-oc-reset: failed` | Reset failed or the header budget expired; the lane cycles keys/resets | Wait or cancel |
+| 429 with `x-oc-reset: failed` | Reset failed or the header budget expired; the lane cycles keys/resets, so wait or cancel |
 | Immediate repeated CPA cooldown | Correct patched CPA + hold enabled for this group; never clear all providers' cooldowns |
 | WARP connected, HTTPS timeout | Proxied trace, tunnel logs and connectivity; no claim of healthy inference |
 | Phone proxy responds but Internet fails | Verify HTTPS through :18889, phone data, tailnet/exit permissions |
